@@ -3,18 +3,152 @@ model:
   embed_dim: 512
   action_dim: 7
   max_depth: 4
-  backbone: openvla-7b
+
+  # Vision Mamba
+  vision_channels: 96
+  vision_layers: 4
+  image_size: 224
+
+  # Task Tree Mamba
+  node_vocab_size: 512
+  tree_layers: 2
+
+  # Multimodal Mamba
+  mm_mamba_layers: 4
+  mm_d_state: 16
+
+  # Action LLM
   action_llm_path: checkpoints/Qwen2.5-0.5B
-  tree_llm_path:   checkpoints/Qwen2.5-1.5B-Instruct
+  action_llm_dim: 896
+  action_llm_layers: 14
+  freeze_action_llm: false
 
-train:
-  batch_size: 32
-  lr: 1.0e-4
-  epochs: 50
-  warmup_steps: 1000
-  grad_clip: 1.0
+  # Tree LLM
+  tree_llm_path: checkpoints/Qwen2.5-1.5B-Instruct
+  tree_llm_dim: 1536
+  freeze_tree_llm: false
+
+  # ActionConditionBuilder
+  state_dim: 15
+  num_state_tokens: 2
+  llm_seq_pool: 32
+
+  # Flow Matching Action Head
+  action_horizon: 16
+  action_head_layers: 8
+  action_head_heads: 8
+  num_inference_timesteps: 20
+
+# =======================================================================
+# Three-stage training pipeline
+# =======================================================================
+pipeline:
   output_dir: outputs/
+  seed: 42
+  fp16: false
+  bf16: true
+  deepspeed_config: MTVLA/configs/ds_config.json
+  log_interval: 50
+  save_interval: 1000
+  eval_interval: 500
 
+  # ------------------------------------------------------------------
+  # Stage 1 — Tree LLM + Multimodal Mamba pre-training
+  # Dataset: RoboCerebra_trainset (fixed, not user-configurable)
+  # Trains: tree_llm, tree_llm_proj, multimodal_mamba
+  # Freezes: vision_mamba, task_tree_mamba, action_llm, action_head
+  # ------------------------------------------------------------------
+  stage1:
+    enabled: true
+    resume_from: null          # path to checkpoint to resume from, or null
+    epochs: 10
+    batch_size: 8
+    lr: 1.0e-4
+    warmup_steps: 500
+    grad_clip: 1.0
+    datasets:
+      - name: robocerebra
+        data_root: dataset/RoboCerebra/RoboCerebra_trainset
+        split: train
+        num_workers: 4
+        image_size: 224
+        max_episode_steps: 512
+
+  # ------------------------------------------------------------------
+  # Stage 2 — Fusion module + Action head joint training
+  # Trains: multimodal_mamba, action_llm_proj, action_condition, action_head
+  # Freezes: vision_mamba, task_tree_mamba, action_llm, tree_llm
+  # Requires: Stage 1 checkpoint loaded via resume_from
+  # ------------------------------------------------------------------
+  stage2:
+    enabled: true
+    resume_from: null          # e.g. outputs/stage1/best.pth
+    epochs: 20
+    batch_size: 16
+    lr: 5.0e-5
+    warmup_steps: 300
+    grad_clip: 1.0
+    datasets:
+      - name: libero
+        data_root: dataset/LIBERO
+        split: train
+        suite: all             # all | libero_spatial | libero_object | libero_goal | libero_100
+        num_workers: 4
+        image_size: 224
+        max_episode_steps: 300
+      # Uncomment to add more datasets for Stage 2:
+      # - name: calvin
+      #   data_root: dataset/CALVIN/task_D_D
+      #   split: training
+      #   suite: D->D           # A->A | B->C | D->D
+      #   num_workers: 4
+      #   image_size: 200
+      # - name: robomme
+      #   data_root: dataset/RoboMME
+      #   split: train
+      #   suite: all
+      #   num_workers: 4
+      #   image_size: 224
+
+  # ------------------------------------------------------------------
+  # Stage 3 — End-to-end fine-tuning
+  # Trains: action_llm (lr×0.1), multimodal_mamba, action_condition, action_head
+  # Freezes: vision_mamba
+  # ------------------------------------------------------------------
+  stage3:
+    enabled: true
+    resume_from: null          # e.g. outputs/stage2/best.pth
+    epochs: 10
+    batch_size: 8
+    lr: 1.0e-5
+    lr_multipliers:
+      action_llm: 0.1          # Action LLM fine-tunes at 1/10 of base lr
+    warmup_steps: 200
+    grad_clip: 1.0
+    datasets:
+      - name: libero
+        data_root: dataset/LIBERO
+        split: train
+        suite: libero_100
+        num_workers: 4
+        image_size: 224
+        max_episode_steps: 300
+      # - name: calvin
+      #   data_root: dataset/CALVIN/task_D_D
+      #   split: training
+      #   suite: D->D
+      #   num_workers: 4
+      #   image_size: 200
+      # - name: robomme
+      #   data_root: dataset/RoboMME
+      #   split: train
+      #   suite: all
+      #   num_workers: 4
+      #   image_size: 224
+
+# ------------------------------------------------------------------
+# Legacy flat data config (used by evaluation scripts)
+# ------------------------------------------------------------------
 data:
   dataset: robocerebra
   data_root: dataset/RoboCerebra/RoboCerebra_trainset

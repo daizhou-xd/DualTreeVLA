@@ -1,8 +1,17 @@
 eval:
   num_episodes: 50
-  render: false
+  horizon: 14              # action sub-steps executed per server query
   record_video: false
+  video_dir: results/libero/videos
   result_dir: results/libero/
+  update_tree_every: 0     # Tree LLM update frequency (0 = disabled)
+
+  # Per-suite max control steps (overrides built-in defaults)
+  max_steps:
+    LIBERO-Spatial: 25
+    LIBERO-Object:  25
+    LIBERO-Goal:    25
+    LIBERO-Long:    95
 
 suites:
   - LIBERO-Spatial
@@ -11,9 +20,10 @@ suites:
   - LIBERO-Long
 
 env:
-  image_size: 224
+  image_size: 448
   obs_keys:
     - agentview_image
+    - robot0_eye_in_hand_image
     - robot0_eef_pos
     - robot0_eef_quat
     - robot0_gripper_qpos

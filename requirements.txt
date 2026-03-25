@@ -1,0 +1,53 @@
+# ============================================================
+# MemoryTreeVLA – Python Dependencies
+# ============================================================
+# Tested on: Python 3.10 / 3.11, CUDA 11.8 or 12.1
+# Install order matters: torch first, then the rest.
+# See README.md for conda environment setup instructions.
+
+# ---- PyTorch (install separately via conda or pip, see README) ----
+# torch>=2.1.0
+# torchvision>=0.16.0
+
+# ---- Core deep learning ----
+einops>=0.7.0
+timm>=0.9.16
+
+# ---- HuggingFace ecosystem ----
+transformers>=4.37.0
+tokenizers>=0.15.0
+accelerate>=0.27.0
+huggingface_hub>=0.21.0
+
+# ---- DeepSpeed (multi-GPU / ZeRO-2 training) ----
+deepspeed>=0.13.0
+
+# ---- Scientific computing ----
+numpy>=1.24.0
+scipy>=1.11.0
+
+# ---- Computer vision ----
+opencv-python>=4.8.0
+Pillow>=10.0.0
+
+# ---- Data & I/O ----
+h5py>=3.9.0          # demo.hdf5 loading (RoboCerebra)
+pyyaml>=6.0
+tqdm>=4.66.0
+
+# ---- Inference server ----
+websockets>=12.0     # MTVLA_server.py WebSocket transport
+
+# ---- Logging & experiment tracking ----
+tensorboard>=2.15.0
+wandb>=0.16.0          # optional; remove if not using W&B
+
+# ---- Evaluation benchmarks ----
+# LIBERO
+# libero @ git+https://github.com/Lifelong-Robot-Learning/LIBERO.git
+# CALVIN (install from source, see README)
+# calvin_agent @ git+https://github.com/mees/calvin.git
+
+# ---- Development ----
+black>=24.0.0
+isort>=5.13.0

@@ -40,11 +40,20 @@ from __future__ import annotations
 
 import json
 import logging
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import torch
 import torch.nn as nn
-from transformers import AutoModelForCausalLM, AutoTokenizer
+
+try:
+    from transformers import AutoModelForCausalLM, AutoTokenizer  # type: ignore[import]  # transformers >= 4.x
+except ImportError:  # very old transformers (< 3.x) used by other projects
+    try:
+        from transformers import AutoModelWithLMHead as AutoModelForCausalLM  # type: ignore[no-redef]
+        from transformers import AutoTokenizer                                  # type: ignore[assignment]
+    except ImportError:
+        AutoModelForCausalLM = None  # type: ignore[assignment,misc]
+        AutoTokenizer = None         # type: ignore[assignment]
 
 from .memory_tree import MemoryTree
 from .tree_scan import VisionMamba, TaskTreeMamba
@@ -160,18 +169,15 @@ class MultimodalMamba(nn.Module):
 # Helper: truncate LLM to N layers and strip LM head (same as InternVL3Embedder)
 # ---------------------------------------------------------------------------
 
-def _truncate_llm(model: nn.Module, n_layers: int) -> nn.Module:
+def _truncate_llm(model: Any, n_layers: int) -> Any:
     """Keep only the first ``n_layers`` transformer layers and replace lm_head
     with Identity (we use hidden states, not logits)."""
-    if hasattr(model, "model"):          # AutoModelForCausalLM → .model.layers
-        inner = model.model
-    else:
-        inner = model
+    inner: Any = model.model if hasattr(model, "model") else model
 
     if hasattr(inner, "layers"):
-        inner.layers = nn.ModuleList(list(inner.layers)[:n_layers])
-    elif hasattr(inner, "h"):            # GPT-2 style
-        inner.h = nn.ModuleList(list(inner.h)[:n_layers])
+        inner.layers = nn.ModuleList(list(inner.layers)[:n_layers])  # type: ignore[arg-type]
+    elif hasattr(inner, "h"):  # GPT-2 style
+        inner.h = nn.ModuleList(list(inner.h)[:n_layers])  # type: ignore[arg-type]
 
     if hasattr(model, "lm_head"):
         model.lm_head = nn.Identity()
@@ -207,20 +213,23 @@ class MemoryTreeVLA(nn.Module):
         # ------------------------------------------------------------------ #
         # 1. Visual encoder: Vision Mamba (GrootVL tree-scan)                #
         # ------------------------------------------------------------------ #
+        # vision_layers is split evenly across two stages; each stage gets
+        # vision_layers // 2 layers (minimum 1).  E.g. vision_layers=4 → [2,2].
+        _half = max(1, m.vision_layers // 2)
         self.vision_mamba = VisionMamba(
             in_chans=3,
             channels=m.vision_channels,
-            num_layers=m.vision_layers,
+            depths=[_half, _half],
             out_dim=D,
-            image_size=m.image_size,
         )
 
         # ------------------------------------------------------------------ #
         # 2. Task-tree encoder: Task Tree Mamba                              #
         # ------------------------------------------------------------------ #
+        # Node-id → embedding lookup (learnable, vocab covers all task nodes)
+        self.node_embedding = nn.Embedding(m.node_vocab_size, D)
         self.task_tree_mamba = TaskTreeMamba(
-            node_vocab_size=m.node_vocab_size,
-            embed_dim=D,
+            d_model=D,
             num_layers=m.tree_layers,
         )
 
@@ -232,6 +241,14 @@ class MemoryTreeVLA(nn.Module):
             d_state=m.mm_d_state,
             n_layers=m.mm_mamba_layers,
         )
+
+        if AutoModelForCausalLM is None:
+            raise ImportError(
+                "transformers >= 4.37 is required for MemoryTreeVLA. "
+                "Install with: pip install transformers>=4.37"
+            )
+        if AutoTokenizer is None:
+            raise ImportError("transformers AutoTokenizer is not available.")
 
         # ------------------------------------------------------------------ #
         # 4. Action LLM (Qwen2.5-0.5B) – feature extractor mode             #
@@ -311,9 +328,10 @@ class MemoryTreeVLA(nn.Module):
         parent_map: Optional[Dict],
     ) -> torch.Tensor:
         """node_ids (B, N) + parent_map  → Z_t (B, N, D)."""
-        if parent_map is not None:
-            self.task_tree_mamba.set_tree(parent_map)
-        return self.task_tree_mamba(node_ids)
+        node_feats = self.node_embedding(node_ids)   # (B, N, D)
+        return self.task_tree_mamba(
+            node_feats, parent_map=parent_map
+        )  # (B, N, D)
 
     def _run_action_llm(self, Z_fused: torch.Tensor) -> torch.Tensor:
         """Z_fused (B, L, D) → llm_out (B, L, D_llm) [last hidden state]."""
@@ -504,7 +522,14 @@ class MemoryTreeVLA(nn.Module):
     def set_memory_tree(self, tree: MemoryTree) -> None:
         """Attach a MemoryTree for the current episode."""
         self.memory_tree = tree
-        self.task_tree_mamba.set_tree(tree.to_parent_map())
+        # MemoryTree.to_parent_map() returns Dict[str, Optional[str]];
+        # convert keys/values to int for TaskTreeMamba which expects int node ids.
+        str_map = tree.to_parent_map()
+        int_map: Dict[int, Optional[int]] = {
+            int(k): (int(v) if v is not None else None)
+            for k, v in str_map.items()
+        }
+        self.task_tree_mamba.set_tree(int_map)
 
     def reset(self) -> None:
         """Reset all episode-level state."""
