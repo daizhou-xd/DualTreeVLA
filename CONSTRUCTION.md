@@ -81,10 +81,13 @@ MemoryTreeVLA 是一种新型的长时程机器人操控架构，通过显式的
 | **Tree LLM** | 任务管理 | $Z_v$（投影）+ Tree 文本描述 | 更新后的 Tree.json | **Qwen2.5-1.5B-Instruct**；低频调用，Instruct 版保证 JSON 格式稳定，推理能力更强 |
 
 **关键数据流**：
-- 视觉模态：$\text{Image} \xrightarrow{\text{Vision Mamba}} Z_v \xrightarrow{\text{Concat}} \text{Multimodal Mamba} \xrightarrow{} Z_{fused}$
-- 树模态：$\text{Tree.json} \xrightarrow{\text{Tree Mamba}} Z_t \xrightarrow{\text{Concat}} \text{Multimodal Mamba} \xrightarrow{} Z_{fused}$
-- 融合特征投影：$Z_{fused} \xrightarrow{\text{Linear Projector}} \text{prefix tokens} \rightarrow$ Action LLM
-- Tree LLM 输入：$Z_v \xrightarrow{\text{Linear Projector}} v_{tokens}$，与 Tree 文本序列化描述拼接后送入 LLM
+
+| 路径 | 流向 |
+|------|------|
+| 视觉模态 | `Image` →(Vision Mamba)→ `Z_v` →(Concat)→ `Multimodal Mamba` → `Z_fused` |
+| 树模态 | `Tree.json` →(Tree Mamba)→ `Z_t` →(Concat)→ `Multimodal Mamba` → `Z_fused` |
+| 融合投影 | `Z_fused` →(Linear Projector)→ `prefix tokens` → Action LLM |
+| Tree LLM 输入 | `Z_v` →(Linear Projector)→ `v_tokens` + Tree 文本序列化 → Tree LLM |
 
 ---
 
@@ -96,81 +99,11 @@ MemoryTreeVLA 是一种新型的长时程机器人操控架构，通过显式的
 2. **选择性关注**：根据当前子任务类型，动态关注视觉特征的相关区域
 3. **长程依赖**：跨越多子任务的长时程记忆保持
 
-### 3.2 具体实现
+### 3.2 融合策略细节
 
-```python
-import torch
-import torch.nn as nn
-from mamba_ssm import Mamba
+**跨树选择性机制**：以任务树特征的全局均值作为条件信号，对视觉特征进行残差门控，动态调节视觉与树信息的融合比例；再将门控后的视觉 tokens 与树 tokens 拼接为统一序列，经多层 Mamba SSM 处理后输出 `Z_fused`。
 
-class MultimodalMamba(nn.Module):
-    """
-    跨模态融合模块：将视觉特征 Z_v 与任务树特征 Z_t 通过选择性 SSM 融合。
-    核心思路源自 GrootVL 的树状扫描，扩展为跨模态双树联合扫描。
-    """
-    def __init__(self, d_model: int, d_state: int = 16, n_layers: int = 4):
-        super().__init__()
-        self.d_model = d_model
-        # 模态投影：将 Z_v 和 Z_t 投影到统一维度
-        self.proj_v = nn.Linear(d_model, d_model)
-        self.proj_t = nn.Linear(d_model, d_model)
-        # 跨模态门控：动态调节视觉与树信息的融合比例
-        self.gate = nn.Sequential(
-            nn.Linear(d_model * 2, d_model),
-            nn.Sigmoid()
-        )
-        # Mamba SSM 层堆叠（线性复杂度 O(L)）
-        self.mamba_layers = nn.ModuleList([
-            Mamba(d_model=d_model, d_state=d_state, d_conv=4, expand=2)
-            for _ in range(n_layers)
-        ])
-        self.norm = nn.LayerNorm(d_model)
-
-    def forward(
-        self,
-        Z_v: torch.Tensor,   # [B, T, D] 视觉时序特征
-        Z_t: torch.Tensor,   # [B, N, D] 任务树结构特征
-    ) -> torch.Tensor:       # [B, T+N, D] 融合特征
-        Z_v = self.proj_v(Z_v)  # [B, T, D]
-        Z_t = self.proj_t(Z_t)  # [B, N, D]
-
-        # 跨模态门控：以任务树状态引导视觉特征的选择性关注
-        # 取树特征的全局均值作为条件信号
-        task_ctx = Z_t.mean(dim=1, keepdim=True).expand_as(Z_v)  # [B, T, D]
-        gate_w = self.gate(torch.cat([Z_v, task_ctx], dim=-1))   # [B, T, D]
-        Z_v_gated = Z_v * gate_w + Z_v  # 残差门控
-
-        # 拼接为统一序列：[视觉 tokens | 树 tokens]
-        Z_concat = torch.cat([Z_v_gated, Z_t], dim=1)  # [B, T+N, D]
-
-        # 多层 Mamba SSM 处理
-        x = Z_concat
-        for layer in self.mamba_layers:
-            x = layer(x) + x  # 残差连接
-        return self.norm(x)  # [B, T+N, D] 即 Z_fused
-```
-
-### 3.3 融合策略细节
-
-跨树选择性机制：
-
-
-```python
-class CrossTreeSSM(nn.Module):
-    def forward(self, Z_v, Z_t):
-        # 构建跨树连接矩阵（基于语义相似度）
-        cross_tree_edges = self.build_cross_edges(Z_v, Z_t)
-        
-        # 统一树状扫描：视觉树与任务树作为同一超图的子树
-        Z_fused = self.unified_tree_ssm(
-            trees=[Z_v, Z_t],
-            intra_edges=[edges_v, edges_t],    # 树内连接
-            inter_edges=cross_tree_edges,       # 树间连接（关键）
-            scan_order='alternating'  # 交替扫描两棵树
-        )
-        
-        return Z_fused
-```
+**统一树状扫描**：视觉树与任务树作为同一超图的子树，构建基于语义相似度的跨树连接矩阵，采用交替扫描（intra-tree → inter-tree → intra-tree）的方式统一处理两棵树的结构信息。
 
 ---
 
@@ -282,8 +215,8 @@ class CrossTreeSSM(nn.Module):
 | 基准 | 特性 | 适配理由 |
 |------|------|----------|
 | **RoboCereBraBench** | 长时程（平均 9.1 步/任务），含 Memory-Exploration / Memory-Execution / Random-Disturbance 模式 | 直接验证树状记忆的长时程规划能力与回溯机制 |
-| **LIBERO-Long** | 5步以上顺序操作任务 | 验证子任务切换的准确性 |
-| **MetaWorld MT-50** | 50类操作任务多样性评估 | 验证 Tree VLM 在不同任务类型下初始化树结构的泛化能力 |
+| **LIBERO**（Spatial / Object / Goal / Long） | 四类任务套组，涵盖空间关系、物体操作、目标导向与长时程序列 | 验证跨任务类型的子任务切换准确性与动作头泛化能力 |
+| **RoboMME** | 多模态机器人操控评估基准，含丰富的场景与语义多样性 | 验证 Tree VLM 对多样化任务描述的树结构初始化与执行鲁棒性 |
 
 ### 7.2 消融实验设计
 
