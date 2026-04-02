@@ -410,15 +410,21 @@ def main():
 
     # ── Resume ───────────────────────────────────────────────────────
     start_epoch = 1
+    best_metric = float("inf")
+    best_epoch = 0
     if args.resume:
         if use_deepspeed:
             _, client_sd = model_engine.load_checkpoint(args.resume)
             start_epoch  = (client_sd or {}).get("epoch", 0) + 1
+            best_metric = (client_sd or {}).get("best_metric", float("inf"))
+            best_epoch = (client_sd or {}).get("best_epoch", 0)
         else:
             ckpt = torch.load(args.resume, map_location=device)
             model.load_state_dict(ckpt["model"], strict=False)
             plain_optimizer.load_state_dict(ckpt["optimizer"])
             start_epoch = ckpt.get("epoch", 0) + 1
+            best_metric = ckpt.get("best_metric", float("inf"))
+            best_epoch = ckpt.get("best_epoch", 0)
         log(f"Resumed from epoch {start_epoch - 1}")
 
     # ── Training loop ────────────────────────────────────────────────
@@ -505,10 +511,64 @@ def main():
                         "model":     model.state_dict(),
                         "optimizer": plain_optimizer.state_dict(),
                         "metrics":   metrics,
+                        "best_metric": best_metric,
+                        "best_epoch": best_epoch,
                     },
                     ckpt_dir / f"{tag}.pt",
                 )
             log(f"  ✓ Checkpoint saved: {ckpt_dir}/{tag}  ({time.time()-t_ckpt:.1f}s)")
+
+        # Always keep one rolling best checkpoint per phase (by L_total)
+        cur_metric_local = metrics.get("L_total", float("inf")) if is_main_process() else 0.0
+        improved_local = False
+        if is_main_process() and cur_metric_local < best_metric:
+            best_metric = cur_metric_local
+            best_epoch = epoch
+            improved_local = True
+
+        if torch.distributed.is_available() and torch.distributed.is_initialized():
+            flag = torch.tensor([1 if improved_local else 0], device=device, dtype=torch.int32)
+            torch.distributed.broadcast(flag, src=0)
+            improved = bool(flag.item())
+
+            best_metric_t = torch.tensor([best_metric if is_main_process() else 0.0], device=device, dtype=torch.float32)
+            best_epoch_t = torch.tensor([best_epoch if is_main_process() else 0], device=device, dtype=torch.int32)
+            torch.distributed.broadcast(best_metric_t, src=0)
+            torch.distributed.broadcast(best_epoch_t, src=0)
+            best_metric = float(best_metric_t.item())
+            best_epoch = int(best_epoch_t.item())
+        else:
+            improved = improved_local
+
+        if improved:
+            best_tag = f"phase{phase}_best"
+            log(f"  ⏳ Saving best checkpoint {best_tag} (epoch={best_epoch}, L_total={best_metric:.4f}) ...")
+            t_best = time.time()
+            if use_deepspeed:
+                model_engine.save_checkpoint(
+                    str(ckpt_dir),
+                    tag=best_tag,
+                    client_state={
+                        "epoch": epoch,
+                        "metrics": metrics,
+                        "best_metric": best_metric,
+                        "best_epoch": best_epoch,
+                    },
+                )
+            elif is_main_process():
+                torch.save(
+                    {
+                        "epoch":     epoch,
+                        "phase":     phase,
+                        "model":     model.state_dict(),
+                        "optimizer": plain_optimizer.state_dict(),
+                        "metrics":   metrics,
+                        "best_metric": best_metric,
+                        "best_epoch": best_epoch,
+                    },
+                    ckpt_dir / f"{best_tag}.pt",
+                )
+            log(f"  ✓ Best checkpoint saved: {ckpt_dir}/{best_tag}  ({time.time()-t_best:.1f}s)")
 
     log("Training complete.")
     if use_wandb and _wandb_run is not None:

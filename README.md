@@ -361,10 +361,10 @@ chmod +x scripts/train_8gpu.sh
 bash scripts/train_8gpu.sh 1
 
 # Phase 2 — 动作预测头训练（约 30 epochs，基于 Phase 1 最优 checkpoint）
-bash scripts/train_8gpu.sh 2 --resume checkpoints/runs/phase1_epochXXXX
+bash scripts/train_8gpu.sh 2 --resume checkpoints/runs/phase1_best
 
 # Phase 3 — 全参数联合微调（自动切换 ZeRO-3，约 10 epochs，基于 Phase 2 最优 checkpoint）
-bash scripts/train_8gpu.sh 3 --resume checkpoints/runs/phase2_epochXXXX
+bash scripts/train_8gpu.sh 3 --resume checkpoints/runs/phase2_best
 ```
 
 也可手动调用 `deepspeed`：
@@ -388,14 +388,14 @@ deepspeed \
 | **Phase 2** 动作头 | + CrossModalFusion + prog_head + FlowMatchingActionHead | $L_\text{flow} + L_\text{prog}$ | 30 | 1e-4 |
 | **Phase 3** 联合微调 | + LLM（全参数） | $L_\text{flow} + L_\text{recon} + L_\text{prog}$ | 10 | 1e-5 |
 
-每阶段完成后修改 `configs/default.yaml` 中的 `train.lr` 和 `train.epochs`，并通过 `--resume` 从上一阶段最佳 checkpoint 继续训练下一阶段（将 `phase*_epochXXXX` 替换为实际最佳目录）。
+每阶段完成后修改 `configs/default.yaml` 中的 `train.lr` 和 `train.epochs`，并通过 `--resume` 从上一阶段最佳 checkpoint 继续训练下一阶段。训练会自动维护每阶段的 `phaseX_best`（按最小 `L_total`）。
 
 ### 断点续训
 
 ```bash
 # 8 卡 DeepSpeed：从 Phase 1 最优 checkpoint 继续训练 Phase 2
 bash scripts/train_8gpu.sh 2 configs/default.yaml \
-  --resume checkpoints/runs/phase1_epochXXXX
+  --resume checkpoints/runs/phase1_best
 
 # 单卡（.pt 格式 checkpoint）
 python train.py \
