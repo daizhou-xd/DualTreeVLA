@@ -2,7 +2,7 @@
 
 层次记忆树视觉-语言-动作模型（Hierarchical Memory Tree Vision-Language-Action Model）
 
-**MemoryTreeVLA** 将在线构建的层次记忆树（HMT）与语义图最小生成树扫描（SGMTS）视觉编码器、Qwen2.5 大语言模型以及基于流匹配的动作预测头融合，用于长时序机器人操作任务。
+**MemoryTreeVLA** 将在线构建的层次记忆树（HMT）与语义图最大生成树扫描（SGMTS）视觉编码器、Qwen2.5 大语言模型以及基于流匹配的动作预测头融合，用于长时序机器人操作任务。
 
 ---
 
@@ -17,18 +17,24 @@
    - [Flash Attention 安装](#flash-attention-安装)
    - [DeepSpeed 安装](#deepspeed-安装)
 3. [数据准备](#数据准备)
+   - [mini-ImageNet](#mini-imagenet)
+   - [RoboCerebra 训练集](#robocerebra-训练集)
+   - [RoboCerebraBench](#robocerebrabench)
+   - [LIBERO](#libero)
 4. [模型权重下载](#模型权重下载)
 5. [配置文件说明](#配置文件说明)
 6. [训练](#训练)
-   - [单卡调试](#单卡调试)
-   - [8 卡 DeepSpeed 训练](#8-卡-deepspeed-训练)
-  - [3 阶段训练流程](#3-阶段训练流程)
+   - [4 阶段训练流程总览](#4-阶段训练流程总览)
+   - [阶段 a — SGMTS Backbone 预训练（mini-ImageNet）](#阶段-a--sgmts-backbone-预训练mini-imagenet)
+   - [阶段 b — 全模型预训练（RoboCerebra）](#阶段-b--全模型预训练robocerebra)
+   - [Phase 1 — FlowMatching 热身（LIBERO）](#phase-1--flowmatching-热身libero)
+   - [Phase 2 — 全量微调（LIBERO）](#phase-2--全量微调libero)
    - [断点续训](#断点续训)
    - [Weights & Biases 可视化](#weights--biases-可视化)
 7. [评估](#评估)
    - [评估指标](#评估指标)
-   - [RoboCerebraBench 评估](#robocerebra_bench-评估)
-   - [RoboCerebra 训练集评估](#robocerebra-trainset-评估)
+   - [RoboCerebraBench 评估](#robocerebrabench-评估)
+   - [RoboCerebra 训练集评估](#robocerebra-训练集评估)
    - [LIBERO 评估](#libero-评估)
    - [结果解读](#结果解读)
 8. [常见问题](#常见问题)
@@ -40,36 +46,52 @@
 ```
 MemoryTreeVLA/
 ├── configs/
-│   ├── default.yaml          # 主训练超参数配置
-│   ├── ds_zero2.json         # DeepSpeed ZeRO-2（Phase 1-2 推荐）
-│   └── ds_zero3.json         # DeepSpeed ZeRO-3 + CPU offload（Phase 3）
+│   ├── default.yaml          # 评估 / 单阶段默认超参
+│   ├── pretrain.yaml         # 阶段 b RoboCerebra 预训练配置
+│   ├── train_phase1.yaml     # Phase 1 LIBERO FlowMatching 热身
+│   ├── train_phase2.yaml     # Phase 2 LIBERO 全量微调
+│   ├── ds_zero2.json         # DeepSpeed ZeRO-2（Phase 1 推荐）
+│   └── ds_zero3.json         # DeepSpeed ZeRO-3 + CPU offload（Phase 2 推荐）
 ├── dataset/
-│   ├── __init__.py
-│   ├── robocerebra.py        # RoboCerebra 训练集加载器
-│   └── robocerebra_bench.py  # RoboCerebraBench 六子集评测加载器
-├── losses/
-│   ├── __init__.py
-│   └── tree_losses.py        # L_recon / L_sem / L_prog / L_elev
-├── models/
-│   ├── __init__.py
-│   ├── attn.py               # FlashMHA（自动选择 Flash Attn / SDPA 后端）
-│   ├── fusion.py             # CrossModalFusion（三路融合）
-│   ├── memory_tree_vla.py    # MemoryTreeVLA 主模型
-│   ├── action_head/
-│   │   └── flow_matching.py  # Flow Matching 动作预测头（DiT + ODE）
-│   ├── memory_tree/
-│   │   ├── node.py           # MemoryNode 六元组
-│   │   ├── tree.py           # HierarchicalMemoryTree（两路插入决策）
-│   │   ├── operations.py     # reinforce / semantic_elevation / prune
-│   │   └── tree_ssm.py       # TreeSSMReadout（权重自适应 Mamba 树递推）
-│   └── sgmts/
-│       └── sgmts.py          # SGMTS 编码器（MST + 语义 Tree-SSM 扫描）
+│   ├── mini-imagenet/        # SGMTS backbone 预训练数据
+│   ├── RoboCerebra/
+│   │   ├── RoboCerebra_trainset/   # 三场景训练集
+│   │   └── RoboCerebraBench/       # 六子集评测集
+│   └── LIBERO/               # LeRobot v2 parquet 格式数据集
+│       └── libero_10/
+├── memory_tree_vla/
+│   ├── dataset/
+│   │   ├── libero.py             # LIBERO LeRobot 数据加载器
+│   │   ├── robocerebra.py        # RoboCerebra 训练集加载器
+│   │   └── robocerebra_bench.py  # RoboCerebraBench 六子集评测加载器
+│   ├── losses/
+│   │   └── tree_losses.py        # l_boundary / l_sem / l_elev / l_recon
+│   └── model/
+│       ├── attn.py               # FlashMHA（自动选择 Flash Attn 2 / SDPA）
+│       ├── fusion.py             # CrossModalFusion（三路门控融合）
+│       ├── memory_tree_vla.py    # MemoryTreeVLA 主模型
+│       ├── semantic_jump_head.py # JumpAwareHead（Mamba 动作突变检测）
+│       ├── action_head/
+│       │   └── flow_matching.py  # FlowMatchingActionHead（DiT + ODE）
+│       ├── memory_tree/
+│       │   ├── node.py           # MemoryNode（leaf / abstract 双类型）
+│       │   ├── tree.py           # HierarchicalMemoryTree（insert / merge / branch）
+│       │   ├── operations.py     # MLPElevation / semantic_elevation
+│       │   └── tree_ssm.py       # TreeSSMReadout（权重自适应 Mamba 树递推）
+│       └── sgmts/
+│           └── sgmts.py          # SGMTSEncoder（MST + 语义 Tree-SSM 扫描）
 ├── scripts/
-│   └── train_8gpu.sh         # 8 卡 DeepSpeed 启动脚本
-├── checkpoints/              # 预训练权重（Qwen2.5）
-├── dataset/RoboCerebra/      # 训练数据集
+│   ├── pretrain.py           # 阶段 b 训练主入口
+│   ├── pretrain.sh           # 阶段 b 多卡启动脚本
+│   ├── train.py              # Phase 1 / 2 训练主入口
+│   ├── train_phase1.sh       # Phase 1 多卡启动脚本
+│   ├── train_phase2.sh       # Phase 2 多卡启动脚本（ZeRO-3）
+│   └── eval.py               # 离线评估脚本
+├── checkpoints/
+│   ├── Qwen2.5-0.5B/         # LLM 权重（已预置）
+│   └── Qwen2.5-1.5B-Instruct/
 ├── requirements.txt
-└── train.py                  # 训练主入口
+└── CONSTRUCTION.md           # 架构设计详细文档
 ```
 
 ---
@@ -95,32 +117,20 @@ MemoryTreeVLA/
 以 **Ubuntu 22.04 / 20.04** 为例（CentOS/Rocky 类似）：
 
 ```bash
-# 若有 sudo 权限，安装系统级编译依赖（可选，有 sudo 才能执行）
-# sudo apt-get update && sudo apt-get install -y build-essential libaio-dev libopenmpi-dev openmpi-bin
-
 # 无 sudo 权限时，用 conda 安装等价依赖（推荐）
 conda install -c conda-forge ninja cmake compilers openmpi -y
 
-# ninja / cmake 也可以用 pip 安装（已写入 requirements.txt）
-pip install ninja cmake
-
-# CUDA Toolkit（若服务器未预装，安装对应驱动版本的 CUDA）
-# 查看当前驱动版本
+# 查看当前 CUDA 驱动版本
 nvidia-smi
 
-# CUDA 12.1 示例安装（根据驱动版本选择匹配的 CUDA）
-wget https://developer.download.nvidia.com/compute/cuda/12.1.0/local_installers/cuda_12.1.0_530.30.02_linux.run
-sudo sh cuda_12.1.0_530.30.02_linux.run --silent --toolkit
-
-# 配置环境变量（添加到 ~/.bashrc 或 ~/.zshrc）
+# 配置环境变量（添加到 ~/.bashrc）
 echo 'export CUDA_HOME=/usr/local/cuda' >> ~/.bashrc
 echo 'export PATH=$CUDA_HOME/bin:$PATH' >> ~/.bashrc
 echo 'export LD_LIBRARY_PATH=$CUDA_HOME/lib64:$LD_LIBRARY_PATH' >> ~/.bashrc
 source ~/.bashrc
 
 # 验证
-nvcc --version
-nvidia-smi
+nvcc --version && nvidia-smi
 ```
 
 ---
@@ -128,12 +138,7 @@ nvidia-smi
 ### Python 环境
 
 ```bash
-# 推荐使用 conda 管理环境
-wget https://repo.anaconda.com/miniconda/Miniconda3-latest-Linux-x86_64.sh
-bash Miniconda3-latest-Linux-x86_64.sh -b -p $HOME/miniconda3
-source $HOME/miniconda3/etc/profile.d/conda.sh
-
-# 创建并激活环境（Python 3.10 与主流深度学习框架最兼容）
+# 推荐 conda 管理环境（Python 3.10）
 conda create -n memorytree python=3.10 -y
 conda activate memorytree
 
@@ -149,102 +154,94 @@ cd MemoryTreeVLA
 **必须先安装 PyTorch，再安装 flash-attn**（flash-attn 编译时需要与 torch 版本匹配）。
 
 ```bash
-# PyTorch 2.2 + CUDA 12.1（推荐组合，A6000 完全支持）
+# PyTorch 2.2 + CUDA 12.1（推荐组合）
 pip install torch==2.2.0 torchvision==0.17.0 --index-url https://download.pytorch.org/whl/cu121
 
-# 验证 GPU 可见且 BFloat16/SDPA 可用
+# 验证
 python -c "
 import torch
 print('CUDA:', torch.cuda.is_available())
 print('GPU count:', torch.cuda.device_count())
-print('GPU 0:', torch.cuda.get_device_name(0))
 print('BF16 support:', torch.cuda.is_bf16_supported())
-print('SDPA available:', hasattr(torch.nn.functional, 'scaled_dot_product_attention'))
 "
-```
-
-期望输出：
-```
-CUDA: True
-GPU count: 8
-GPU 0: NVIDIA RTX A6000
-BF16 support: True
-SDPA available: True
 ```
 
 ---
 
 ### Flash Attention 安装
 
-Flash Attention 2 需要在线编译，耗时约 10-30 分钟：
-
 ```bash
-# 确保环境变量正确
 export CUDA_HOME=/usr/local/cuda
-export PATH=$CUDA_HOME/bin:$PATH
-
-# 安装（--no-build-isolation 使用当前环境的 torch）
 pip install flash-attn --no-build-isolation
 
 # 验证
 python -c "from flash_attn import flash_attn_func; print('flash-attn OK')"
 ```
 
-> **注意**：若编译失败，可跳过此步骤。项目会自动回退到 PyTorch 内置的 SDPA 后端，在 A6000（sm_86）上仍可调用高效的 Flash Attention 内核，性能损失极小。
+> 若编译失败可跳过，项目自动回退到 PyTorch 内置 SDPA，性能损失极小。
 
 ---
 
 ### DeepSpeed 安装
 
 ```bash
-# 安装其余依赖
+# 安装项目其余依赖
 pip install -r requirements.txt
 
-# 安装 DeepSpeed（包含 CUDA 算子编译）
+# 安装 DeepSpeed
 DS_BUILD_OPS=1 pip install deepspeed --no-build-isolation
 
 # 验证
-python -c "import deepspeed; print('DeepSpeed version:', deepspeed.__version__)"
-ds_report   # 打印各算子编译状态
+python -c "import deepspeed; print('DeepSpeed', deepspeed.__version__)"
+ds_report
 ```
 
-> 若 `DS_BUILD_OPS=1` 编译过慢，可使用 `pip install deepspeed` 跳过预编译，算子将在首次使用时 JIT 编译。
+> 若编译过慢，可使用 `pip install deepspeed` 跳过预编译，算子将在首次使用时 JIT 编译。
 
 ---
 
-### Weights & Biases 安装
-
-wandb 为可选依赖，不安装不影响训练（graceful fallback）：
+### Weights & Biases 安装（可选）
 
 ```bash
 pip install wandb
-
-# 登录（只需执行一次，令牌保存在 ~/.netrc）
-wandb login
-# 国内访问不稳定时，可使用代理或 offline 模式（见下方说明）
+wandb login   # 令牌保存在 ~/.netrc，只需执行一次
 ```
 
 ---
 
 ## 数据准备
 
-### RoboCerebra 数据集
+### mini-ImageNet
 
-将数据集解压至项目目录，目录结构如下：
+用于阶段 a 的 **SGMTS backbone 预训练**（图像分类监督），需提前下载。
 
 ```
-dataset/
-└── RoboCerebra/
-    └── RoboCerebra_trainset/
-        ├── coffee_table/
-        │   ├── case1/
-        │   │   ├── demo.hdf5           # 动作(T,7) + 状态(T,84)
-        │   │   ├── case1.mp4           # RGB 视频
-        │   │   └── task_description.json  # 子任务标注
-        │   └── case2/
-        │       └── ...
-        ├── kitchen_table/
-        └── study_table/
+dataset/mini-imagenet/
+└── data/
+    ├── train/
+    │   ├── n01532829/   # 每类约 600 张 JPEG
+    │   └── ...          # 共 64 类
+    ├── val/             # 16 类
+    └── test/            # 20 类
+```
+
+> 从 [Kaggle mini-ImageNet](https://www.kaggle.com/datasets/arjunashok33/miniimagenet) 或官方来源下载后解压到 `dataset/mini-imagenet/data/`。
+
+---
+
+### RoboCerebra 训练集
+
+```
+dataset/RoboCerebra/RoboCerebra_trainset/
+├── coffee_table/
+│   ├── case1/
+│   │   ├── demo.hdf5              # 动作(T,7) + 状态(T,84)
+│   │   ├── case1.mp4              # RGB 视频
+│   │   └── task_description.json  # 子任务标注
+│   └── case2/
+│       └── ...
+├── kitchen_table/
+└── study_table/
 ```
 
 `task_description.json` 格式示例：
@@ -263,48 +260,13 @@ dataset/
 }
 ```
 
-验证数据加载：
-
-```bash
-python -c "
-from dataset import RoboCerebraDataset
-ds = RoboCerebraDataset('dataset/RoboCerebra/RoboCerebra_trainset', subsample=4)
-print(f'Trajectories: {len(ds)}')
-sample = ds[0]
-print('frames:', sample['frames'].shape)
-print('actions:', sample['actions'].shape)
-print('states:', sample['states'].shape)
-print('instruction:', sample['instruction'])
-"
-```
-
-### RoboCerebraBench 评测数据集
-
-RoboCerebraBench 是官方基准测试集，包含六种任务类型（各 10 个 case），已下载至：
-
-```
-dataset/RoboCerebra/RoboCerebraBench/
-    Ideal/                    # 标准长时序任务
-    Memory_Execution/         # 记忆引导执行
-    Memory_Exploration/       # 记忆引导探索
-    Mix/                      # 动态扰动 + 观测偏移混合
-    Observation_Mismatching/  # 观测描述偏移
-    Random_Disturbance/       # 随机物体扰动
-        case1/
-            demo.hdf5            # 动作(T,7) + 状态(T,71)
-            case1.mp4
-            task_description.txt # 子任务步骤与时间戳
-            goal.json            # 目标条件
-            *.bddl
-```
-
-若数据丢失可重新下载：
+重新下载：
 
 ```bash
 pip install -U huggingface_hub
-hf download qiukingballball/RoboCerebra \
-    --type dataset \
-    --include "RoboCerebraBench/**" \
+huggingface-cli download qiukingballball/RoboCerebra \
+    --repo-type dataset \
+    --include "RoboCerebra_trainset/**" \
     --local-dir dataset/RoboCerebra
 ```
 
@@ -312,209 +274,268 @@ hf download qiukingballball/RoboCerebra \
 
 ```bash
 python -c "
-from dataset.robocerebra_bench import RoboCerebraBenchDataset, BENCH_TASK_TYPES
-ds = RoboCerebraBenchDataset('dataset/RoboCerebra/RoboCerebraBench')
-print(f'Total cases: {len(ds)}')
-for tt in BENCH_TASK_TYPES:
-    n = sum(1 for c in ds.cases if c.task_type == tt)
-    print(f'  {tt}: {n}')
+from memory_tree_vla.dataset import RoboCerebraDataset
+ds = RoboCerebraDataset('dataset/RoboCerebra/RoboCerebra_trainset', subsample=4)
+print(f'Trajectories: {len(ds)}')
+s = ds[0]
+print('frames:', s['frames'].shape, '  actions:', s['actions'].shape)
 "
 ```
 
 ---
 
-## 模型权重下载
+### RoboCerebraBench
 
-项目使用 **Qwen2.5-1.5B-Instruct**（Phase 1-2）或 **Qwen2.5-0.5B**（快速调试）：
+官方基准集，包含六种任务类型各 10 个 case：
+
+```
+dataset/RoboCerebra/RoboCerebraBench/
+├── Ideal/
+├── Memory_Execution/
+├── Memory_Exploration/
+├── Mix/
+├── Observation_Mismatching/
+└── Random_Disturbance/
+    └── case1/
+        ├── demo.hdf5              # 动作(T,7) + 状态(T,71)
+        ├── case1.mp4
+        └── task_description.txt
+```
+
+重新下载：
 
 ```bash
-# 方式一：从 ModelScope 下载（国内推荐）
+huggingface-cli download qiukingballball/RoboCerebra \
+    --repo-type dataset \
+    --include "RoboCerebraBench/**" \
+    --local-dir dataset/RoboCerebra
+```
+
+---
+
+### LIBERO
+
+用于 Phase 1 / 2 训练（LeRobot v2 parquet 格式），已通过脚本下载至 `dataset/LIBERO/libero_10/`：
+
+```bash
+# 重新下载（若目录缺失）
+python -c "
+from huggingface_hub import snapshot_download
+snapshot_download(
+    repo_id='lerobot/libero_10_image',
+    repo_type='dataset',
+    local_dir='dataset/LIBERO/libero_10',
+)
+print('Done')
+"
+```
+
+> 如需下载 libero_spatial / libero_object / libero_goal，将 `repo_id` 中的 `libero_10_image` 替换为对应名称。
+
+---
+
+## 模型权重下载
+
+项目已预置 `checkpoints/Qwen2.5-0.5B/` 和 `checkpoints/Qwen2.5-1.5B-Instruct/`。若权重缺失：
+
+```bash
+# 方式一：ModelScope（国内推荐）
 pip install modelscope
 python -c "
 from modelscope import snapshot_download
 snapshot_download('Qwen/Qwen2.5-1.5B-Instruct', cache_dir='checkpoints')
 "
 
-# 方式二：从 HuggingFace 下载
-pip install huggingface_hub
+# 方式二：HuggingFace CLI
 huggingface-cli download Qwen/Qwen2.5-1.5B-Instruct \
     --local-dir checkpoints/Qwen2.5-1.5B-Instruct
-
-# 验证权重文件
-ls checkpoints/Qwen2.5-1.5B-Instruct/
-# 应包含: config.json  model.safetensors  tokenizer.json  tokenizer_config.json
 ```
-
-> 项目中已预置 `checkpoints/Qwen2.5-1.5B-Instruct/` 目录，若权重已存在可跳过此步。
 
 ---
 
 ## 配置文件说明
 
-主配置文件 `configs/default.yaml`，关键参数：
+| 配置文件 | 用途 | 主要可训练模块 |
+|---|---|---|
+| `configs/pretrain.yaml` | 阶段 b：RoboCerebra 预训练 | SGMTS, sem_proj, JumpAwareHead, TreeSSM, MLPElevation |
+| `configs/train_phase1.yaml` | Phase 1：LIBERO FlowMatching 热身 | CrossModalFusion, FlowMatchingActionHead |
+| `configs/train_phase2.yaml` | Phase 2：LIBERO 全量微调 | 全部模块 |
+| `configs/default.yaml` | 评估 / 单阶段默认 | — |
+
+关键共享参数（`configs/default.yaml`）：
 
 ```yaml
 model:
-  llm_path:   "checkpoints/Qwen2.5-1.5B-Instruct"
-  d:          256       # 统一嵌入维度
-  H_a:        16        # 动作预测步长
-  theta_fuse: 0.35      # 记忆树合并阈值（越小越易合并）
-  K_elev:     4         # 触发语义提升的子节点数阈值
-
-train:
-  batch_size: 4         # 每 GPU micro-batch 大小
-  lr:         1.0e-4
-
-deepspeed:
-  enabled: false                    # 命令行 --deepspeed 覆盖
-  config:  "configs/ds_zero2.json"  # Phase 1-2；Phase 3 用 ds_zero3.json
+  llm_path:    "checkpoints/Qwen2.5-0.5B"
+  sgmts_ckpt:  null        # 阶段 a 训练后的 SGMTS 权重路径
+  d:           256         # 统一嵌入维度
+  H_a:         16          # 动作预测步长
+  theta_fuse:  0.35        # 记忆树合并阈值（预训练后 0.35，未对齐时 0.65）
+  K_elev:      4           # 触发语义提升的子节点数阈值
 ```
-
-DeepSpeed 配置对应关系：
-
-| Phase | 推荐 DeepSpeed 配置 | ZeRO 级别 | 说明 |
-|---|---|---|---|
-| 1-2 | `configs/ds_zero2.json` | ZeRO-2 | 切分优化器状态+梯度，参数整体保留 |
-| 3   | `configs/ds_zero3.json` | ZeRO-3 + CPU offload | 联合微调，显存压力最小 |
 
 ---
 
 ## 训练
 
-### 单卡调试
+### 4 阶段训练流程总览
 
-在正式多卡训练前，建议先在单卡验证数据流：
+```
+[a] SGMTS Backbone 预训练  ──→  [b] 全模型预训练  ──→  Phase 1  ──→  Phase 2
+    mini-ImageNet (L_cls)        RoboCerebra             LIBERO         LIBERO
+                                 (L_boundary+L_sem+L_elev) (L_flow)      (L_flow)
+```
+
+| 阶段 | 数据集 | 可训练模块 | 损失函数 | 脚本 |
+|---|---|---|---|---|
+| **[a] SGMTS 预训练** | mini-ImageNet | SGMTSEncoder (backbone only) | $L_\text{cls}$ (分类交叉熵) | `pretrain.py --stage sgmts` |
+| **[b] 全模型预训练** | RoboCerebra | SGMTS, sem_proj, JumpAwareHead, TreeSSM, MLPElevation | $L_\text{boundary}+L_\text{sem}+L_\text{elev}$ | `pretrain.sh` |
+| **Phase 1** | LIBERO | CrossModalFusion, FlowMatchingActionHead | $L_\text{flow}$ | `train_phase1.sh` |
+| **Phase 2** | LIBERO | 全部模块 | $L_\text{flow}$ | `train_phase2.sh` |
+
+> **冻结说明**：LLM backbone 在 [b] / Phase 1 阶段始终冻结。Phase 2 中以 0.1× 学习率微调 LLM。
+
+---
+
+### 阶段 a — SGMTS Backbone 预训练（mini-ImageNet）
+
+单独训练 SGMTS 视觉编码器的 Backbone，在 mini-ImageNet 上做图像分类，获得有效的语义补丁特征：
 
 ```bash
 conda activate memorytree
 cd /path/to/MemoryTreeVLA
 
-python train.py \
-    --config configs/default.yaml \
-    --phase 1
+# 单卡调试
+python scripts/pretrain.py --config configs/default.yaml --stage sgmts
+
+# 多卡（推荐）
+accelerate launch \
+    --num_processes 8 \
+    --mixed_precision bf16 \
+    scripts/pretrain.py \
+        --config configs/default.yaml \
+        --stage sgmts \
+        --data_root dataset/mini-imagenet/data \
+        --epochs 100 \
+        --ckpt_dir checkpoints/runs/sgmts
 ```
 
-### 8 卡 DeepSpeed 训练
+训练完成后将权重路径填入 `configs/default.yaml` 的 `model.sgmts_ckpt`：
 
-使用提供的启动脚本：
+```yaml
+model:
+  sgmts_ckpt: "checkpoints/runs/sgmts/sgmts_best.pt"
+```
+
+---
+
+### 阶段 b — 全模型预训练（RoboCerebra）
+
+基于阶段 a 的 SGMTS，训练 JumpAwareHead、TreeSSM、MLPElevation 等语义结构学习模块：
 
 ```bash
-# 给脚本添加执行权限
-chmod +x scripts/train_8gpu.sh
+# 单卡调试
+python scripts/pretrain.py --config configs/pretrain.yaml
 
-# Phase 1 — 视觉主干预热（约 20 epochs）
-bash scripts/train_8gpu.sh 1
+# 多卡（推荐，8 GPU）
+bash scripts/pretrain.sh
 
-# Phase 2 — 动作预测头训练（约 30 epochs，基于 Phase 1 最优 checkpoint）
-bash scripts/train_8gpu.sh 2 --resume checkpoints/runs/phase1_best
-
-# Phase 3 — 全参数联合微调（自动切换 ZeRO-3，约 10 epochs，基于 Phase 2 最优 checkpoint）
-bash scripts/train_8gpu.sh 3 --resume checkpoints/runs/phase2_best
+# 指定 GPU 数量
+bash scripts/pretrain.sh 4
 ```
 
-也可手动调用 `deepspeed`：
+Checkpoint 保存至 `checkpoints/runs/pretrain/`，最优模型为 `pretrain_best.pt`。
+
+---
+
+### Phase 1 — FlowMatching 热身（LIBERO）
+
+冻结语义模块，仅训练 CrossModalFusion 和 FlowMatchingActionHead：
 
 ```bash
-deepspeed \
-    --num_gpus 8 \
-    --master_port 29500 \
-    train.py \
-    --deepspeed \
-    --deepspeed_config configs/ds_zero2.json \
-    --config configs/default.yaml \
-    --phase 1
+# 单卡调试（需先完成阶段 b）
+python scripts/train.py --config configs/train_phase1.yaml --phase 1
+
+# 多卡
+bash scripts/train_phase1.sh
+
+# 指定 GPU 数量
+bash scripts/train_phase1.sh 4
 ```
 
-### 3 阶段训练流程
+配置文件 `configs/train_phase1.yaml` 中 `model.pretrain_ckpt` 指向阶段 b 的输出：
 
-| 阶段 | 训练模块 | 损失函数 | 建议 epochs | 建议 lr |
-|---|---|---|---|---|
-| **Phase 1** 视觉预热 | SGMTS + s_proj + TreeSSM | $L_\text{recon}$ | 20 | 1e-4 |
-| **Phase 2** 动作头 | + CrossModalFusion + prog_head + FlowMatchingActionHead | $L_\text{flow} + L_\text{prog}$ | 30 | 1e-4 |
-| **Phase 3** 联合微调 | + LLM（全参数） | $L_\text{flow} + L_\text{recon} + L_\text{prog}$ | 10 | 1e-5 |
+```yaml
+model:
+  pretrain_ckpt: "checkpoints/runs/pretrain/pretrain_best.pt"
+```
 
-每阶段完成后修改 `configs/default.yaml` 中的 `train.lr` 和 `train.epochs`，并通过 `--resume` 从上一阶段最佳 checkpoint 继续训练下一阶段。训练会自动维护每阶段的 `phaseX_best`（按最小 `L_total`）。
+---
+
+### Phase 2 — 全量微调（LIBERO）
+
+解冻全部模块（LLM 以 0.1× 学习率），使用 DeepSpeed ZeRO-3：
+
+```bash
+# 多卡（ZeRO-3，自动加载 configs/ds_zero3.json）
+bash scripts/train_phase2.sh
+
+# 指定 GPU 数量
+bash scripts/train_phase2.sh 4
+```
+
+配置文件 `configs/train_phase2.yaml` 中 `train.init_from` 指向 Phase 1 最优 checkpoint。
+
+---
 
 ### 断点续训
 
 ```bash
-# 8 卡 DeepSpeed：从 Phase 1 最优 checkpoint 继续训练 Phase 2
-bash scripts/train_8gpu.sh 2 configs/default.yaml \
-  --resume checkpoints/runs/phase1_best
+# 阶段 b 断点续训（指定 .pt 文件）
+python scripts/pretrain.py \
+    --config configs/pretrain.yaml \
+    --resume checkpoints/runs/pretrain/pretrain_ep015.pt
 
-# 单卡（.pt 格式 checkpoint）
-python train.py \
-    --config configs/default.yaml \
-    --phase 3 \
-    --resume checkpoints/runs/phase3_epoch0010.pt
-
-# 8 卡 DeepSpeed（目录格式 checkpoint）
-bash scripts/train_8gpu.sh 3 configs/default.yaml \
-    --resume checkpoints/runs/phase3_epoch0010
+# Phase 1 断点续训（修改 yaml 中的 resume_from 字段即可）
+# 或命令行指定（train.py 支持 --resume）
+python scripts/train.py \
+    --config configs/train_phase1.yaml \
+    --phase 1 \
+    --resume checkpoints/runs/phase1/phase1_ep010.pt
 ```
 
-Checkpoint 默认保存在 `checkpoints/runs/`，每 `save_every`（默认 5）个 epoch 保存一次：
+Checkpoint 结构：
 
 ```
 checkpoints/runs/
-├── phase1_epoch0005/        # DeepSpeed 格式（目录）
-│   ├── zero_pp_rank_0_mp_rank_00_model_states.pt
-│   └── ...
-└── phase3_epoch0010.pt      # 单卡格式（文件）
+├── sgmts/
+│   ├── sgmts_ep050.pt
+│   └── sgmts_best.pt
+├── pretrain/
+│   ├── pretrain_ep010.pt
+│   └── pretrain_best.pt
+├── phase1/
+│   ├── phase1_ep005.pt
+│   └── phase1_best.pt
+└── phase2/
+    ├── phase2_ep005/        # DeepSpeed ZeRO-3 格式（目录）
+    └── phase2_best.pt
 ```
 
 ---
 
 ### Weights & Biases 可视化
 
-#### 启用 wandb
-
-在任何训练命令后加 `--wandb` 即可启用：
-
 ```bash
-# 单卡调试 + wandb
-python train.py \
-    --config configs/default.yaml \
-    --phase 1 \
-    --wandb \
-    --wandb_project MemoryTreeVLA \
-    --wandb_name "phase1_debug"
+# 训练时写入本地（国内网络推荐 offline 模式）
+WANDB_MODE=offline python scripts/pretrain.py \
+    --config configs/pretrain.yaml
 
-# 8 卡 DeepSpeed + wandb（--wandb 会通过 EXTRA_ARGS 透传）
-bash scripts/train_8gpu.sh 1 configs/default.yaml \
-    --wandb --wandb_project MemoryTreeVLA --wandb_tags phase1 a6000
-
-# 全阶段训练脚本（带 wandb）
-for PHASE in 1 2 3; do
-    bash scripts/train_8gpu.sh ${PHASE} configs/default.yaml \
-        --wandb --wandb_project MemoryTreeVLA --wandb_tags "phase${PHASE}"
-done
-```
-
-#### wandb 上可查看的指标
-
-| 面板 | 指标 | 说明 |
-|---|---|---|
-| **train/** | `step_loss` | 每 `log_every` 步的总损失 |
-| **train/** | `step_flow` | Flow Matching 速度场损失 |
-| **train/** | `step_recon` | 节点视觉重建损失 |
-| **train/** | `step_prog` | 进度单调损失 |
-| **train/** | `epoch_loss/flow/recon/prog` | 每 epoch 均值损失曲线 |
-| **train/** | `lr` | 当前学习率（余弦衰减可视化） |
-| **train/** | `epoch_time_s` | 每 epoch 耗时 |
-| **train/** | `grad_norm_max/mean` | 梯度范数（每 `save_every` epoch 记录） |
-
-#### 国内网络离线模式
-
-若服务器访问 wandb.ai 不稳定，可先用 offline 模式再上传：
-
-```bash
-# 训练时写入本地
-WANDB_MODE=offline python train.py --config configs/default.yaml --phase 1 --wandb
-
-# 训练完毕后手动同步
+# 手动同步
 wandb sync wandb/offline-run-*
 ```
+
+各阶段 wandb 项目名在对应 yaml 中通过 `wandb_project` 字段配置。
 
 ---
 
@@ -522,213 +543,135 @@ wandb sync wandb/offline-run-*
 
 ### 评估指标
 
-`eval.py` 支持对以下三个基准进行**离线轨迹评估**（offline trajectory evaluation），使用 teacher-forcing 方式逐帧喂入模型，对比预测动作与真值动作：
+`eval.py` 支持对以下三个基准进行**离线轨迹评估**，使用 teacher-forcing 方式逐帧喂入模型：
 
 | 指标 | 说明 | 适用数据集 |
 |---|---|---|
-| `action_l1` | 每步 $\|a_{\text{pred}}[0] - a_{\text{gt}}\|_1$（预测动作块第一步 vs 真值） | 全部 |
+| `action_l1` | 每步 $\|a_{\text{pred}}[0] - a_{\text{gt}}\|_1$ | 全部 |
 | `action_l2` | 每步 $\|a_{\text{pred}}[0] - a_{\text{gt}}\|_2$ | 全部 |
 | `tree_nodes` | 轨迹末尾记忆树节点数（均值） | 全部 |
 | `tree_depth` | 轨迹末尾记忆树最大深度（均值） | 全部 |
-| `tree_branches` | 每条轨迹分支创建次数（语义跳变次数） | 全部 |
-| `tree_elevations` | 每条轨迹语义提升（elevation）次数 | 全部 |
-| `subtask_boundary_f1` | 分支创建事件与 GT 子任务边界的 F1（±`boundary_tol` 步容忍） | RoboCerebra / Bench |
-| `subtask_sr` | GT 子任务边界中被正确检测到的比例 | RoboCerebra / Bench |
+| `tree_branches` | 每条轨迹分支创建次数 | 全部 |
+| `tree_elevations` | 每条轨迹语义提升次数 | 全部 |
+| `subtask_boundary_f1` | 分支事件与 GT 子任务边界的 F1（±`boundary_tol` 步容忍） | RoboCerebra / Bench |
+| `subtask_sr` | GT 子任务边界中被成功检测的比例 | RoboCerebra / Bench |
 | `prog_monotone_rate` | 树中祖先-后代对语义进度单调的比例 | RoboCerebra / Bench |
 
 ---
 
-### RoboCerebraBench 评估 {#robocerebra_bench-评估}
-
-RoboCerebraBench 是官方基准集，包含 6 种任务类型各 10 个 case，评估结果自动按任务类型分组汇报。
+### RoboCerebraBench 评估
 
 ```bash
 conda activate memorytree
 cd /path/to/MemoryTreeVLA
 
-# 评估全部 6 种任务类型（推荐，最终上报结果时使用）
-python eval.py \
-    --ckpt  checkpoints/runs/phase3_best \
+# 评估全部 6 种任务类型（推荐）
+python scripts/eval.py \
+    --ckpt  checkpoints/runs/phase2/phase2_best.pt \
     --config configs/default.yaml \
     --dataset robocerebra_bench \
     --bench_root dataset/RoboCerebra/RoboCerebraBench \
     --out results/bench_eval.json
 
 # 只评估特定子集
-python eval.py \
-    --ckpt  checkpoints/runs/phase3_best \
+python scripts/eval.py \
+    --ckpt  checkpoints/runs/phase2/phase2_best.pt \
     --dataset robocerebra_bench \
     --bench_root dataset/RoboCerebra/RoboCerebraBench \
-    --task_types Ideal Random_Disturbance Memory_Execution \
+    --task_types Ideal Random_Disturbance \
     --out results/bench_partial.json
 
-# 快速调试（限制数量 + CPU）
-python eval.py \
-    --ckpt  checkpoints/runs/phase3_best \
+# 快速调试（限制轨迹数）
+python scripts/eval.py \
+    --ckpt  checkpoints/runs/phase2/phase2_best.pt \
     --dataset robocerebra_bench \
     --bench_root dataset/RoboCerebra/RoboCerebraBench \
     --max_traj 6 \
     --device cpu
 ```
 
-**典型输出**（`robocerebra_bench`）：
+**典型输出**：
 
 ```
-======================================================================
-  PER TASK-TYPE RESULTS  (RoboCerebraBench)
-======================================================================
-  Ideal                          n= 10  L1=0.0812  L2=0.1534  F1=0.7241  SR=0.7833  mono=0.8901
-  Memory_Execution               n= 10  L1=0.0891  L2=0.1672  F1=0.6823  SR=0.7500  mono=0.8745
-  Memory_Exploration             n= 10  L1=0.0934  L2=0.1758  F1=0.6512  SR=0.7167  mono=0.8612
-  Mix                            n= 10  L1=0.1023  L2=0.1921  F1=0.6102  SR=0.6833  mono=0.8401
-  Observation_Mismatching        n= 10  L1=0.0967  L2=0.1813  F1=0.6321  SR=0.7000  mono=0.8534
-  Random_Disturbance             n= 10  L1=0.0988  L2=0.1856  F1=0.6234  SR=0.6917  mono=0.8478
+PER TASK-TYPE RESULTS  (RoboCerebraBench)
+================================================================================
+  Ideal                    n=10  L1=0.0812  L2=0.1534  F1=0.7241  SR=0.7833
+  Memory_Execution         n=10  L1=0.0891  L2=0.1672  F1=0.6823  SR=0.7500
+  Memory_Exploration       n=10  L1=0.0934  L2=0.1758  F1=0.6512  SR=0.7167
+  Mix                      n=10  L1=0.1023  L2=0.1921  F1=0.6102  SR=0.6833
+  Observation_Mismatching  n=10  L1=0.0967  L2=0.1813  F1=0.6321  SR=0.7000
+  Random_Disturbance       n=10  L1=0.0988  L2=0.1856  F1=0.6234  SR=0.6917
 
-============================================================
-  OVERALL SUMMARY
-------------------------------------------------------------
-  Metric                              Value
-------------------------------------------------------------
-  action_l1                        0.0936  ±0.0287
-  action_l2                        0.1759  ±0.0541
-  subtask_boundary_f1              0.6539  ±0.1203
-  subtask_sr                       0.7208  ±0.0891
-  prog_monotone_rate               0.8612  ±0.0412
-============================================================
-Results saved to results/bench_eval.json
+OVERALL  action_l1=0.0936  action_l2=0.1759  F1=0.6539  SR=0.7208  mono=0.8612
 ```
 
 ---
 
-### RoboCerebra Trainset 评估 {#robocerebra-trainset-评估}
-
-RoboCerebra 训练集包含子任务边界标注，可用于验证集检验 checkpoint 泛化能力：
+### RoboCerebra 训练集评估
 
 ```bash
-# 评估 Phase 3 最优 checkpoint
-python eval.py \
-    --ckpt  checkpoints/runs/phase3_best \
+python scripts/eval.py \
+    --ckpt  checkpoints/runs/phase2/phase2_best.pt \
     --config configs/default.yaml \
     --dataset robocerebra \
     --data_root dataset/RoboCerebra/RoboCerebra_trainset \
     --out results/robocerebra_train_eval.json
 
-# 只评估部分场景（快速验证）
-python eval.py \
-    --ckpt  checkpoints/runs/phase3_best \
+# 只评估部分场景
+python scripts/eval.py \
+    --ckpt  checkpoints/runs/phase2/phase2_best.pt \
     --dataset robocerebra \
     --data_root dataset/RoboCerebra/RoboCerebra_trainset \
     --scenes coffee_table kitchen_table \
-    --max_traj 50 \
-    --out results/partial_eval.json
+    --max_traj 50
 ```
 
 ---
 
 ### LIBERO 评估
 
-LIBERO 数据集目录结构如下，请提前准备好：
-
-```
-dataset/LIBERO/
-    libero_spatial/
-        LIVING_ROOM_SCENE2_pick_up_the_alphabet_soup_demo.hdf5
-        ...   (每个子集 10 个 task，每个 task 约 50 条 demo)
-    libero_object/
-    libero_goal/
-    libero_long/
-```
-
-> **下载**：从 [LIBERO 官网](https://libero-project.github.io/) 或 [Hugging Face](https://huggingface.co/datasets/LIBERO-project/LIBERO) 下载数据集，放置到 `dataset/LIBERO/`。
-
 ```bash
-# 评估 LIBERO-LONG（主要长程测试集，对应 Phase 3）
-python eval.py \
-  --ckpt  checkpoints/runs/phase3_epoch0010.pt \
+# LIBERO-10（主要测试集）
+python scripts/eval.py \
+    --ckpt  checkpoints/runs/phase2/phase2_best.pt \
     --config configs/default.yaml \
     --dataset libero \
     --data_root dataset/LIBERO \
     --libero_split long \
     --out results/libero_long_eval.json
 
-# 评估 LIBERO-SPATIAL（空间关系泛化）
-python eval.py \
-  --ckpt  checkpoints/runs/phase3_epoch0010.pt \
-    --config configs/default.yaml \
-    --dataset libero \
-    --data_root dataset/LIBERO \
-    --libero_split spatial \
-    --out results/libero_spatial_eval.json
-
-# 评估所有子集（循环脚本）
+# 所有子集
 for SPLIT in spatial object goal long; do
-    python eval.py \
-    --ckpt  checkpoints/runs/phase3_epoch0010.pt \
-        --config configs/default.yaml \
+    python scripts/eval.py \
+        --ckpt  checkpoints/runs/phase2/phase2_best.pt \
         --dataset libero \
         --data_root dataset/LIBERO \
         --libero_split ${SPLIT} \
         --out results/libero_${SPLIT}_eval.json
 done
-
-# 快速调试（每个子集只评估 20 条轨迹）
-python eval.py \
-  --ckpt  checkpoints/runs/phase3_epoch0010.pt \
-    --config configs/default.yaml \
-    --dataset libero \
-    --data_root dataset/LIBERO \
-    --libero_split long \
-    --max_traj 20 \
-    --device cpu
 ```
 
 ---
 
-### 常用参数说明
+### 常用评估参数
 
 | 参数 | 默认值 | 说明 |
 |---|---|---|
-| `--ckpt` | 必填 | `.pt` 模型文件（单卡）或 DeepSpeed checkpoint 目录 |
-| `--config` | `configs/default.yaml` | 与训练时使用的 YAML 配置文件 |
+| `--ckpt` | 必填 | `.pt` 模型文件或 DeepSpeed checkpoint 目录 |
+| `--config` | `configs/default.yaml` | 与训练时一致的 YAML |
 | `--dataset` | 必填 | `robocerebra_bench` / `robocerebra` / `libero` |
-| `--bench_root` | `dataset/RoboCerebra/RoboCerebraBench` | RoboCerebraBench 根目录（`robocerebra_bench` 专用） |
-| `--task_types` | 全 6 类 | 仅评估指定子集，空格分隔，如 `Ideal Random_Disturbance` |
-| `--data_root` | 无 | 数据集根目录（`robocerebra` / `libero` 专用） |
-| `--libero_split` | `long` | LIBERO 子集：`spatial`, `object`, `goal`, `long` |
-| `--scenes` | 全部 | RoboCerebra 训练集场景筛选，如 `coffee_table kitchen_table` |
-| `--subsample` | 来自 config | 时序下采样（1 = 每帧，4 = 每 4 帧） |
-| `--max_traj` | 全部 | 限制评估轨迹数（调试用） |
-| `--max_seqlen` | 来自 config | 截断长轨迹到该步数 |
-| `--device` | `cuda` | `cuda`, `cuda:0`, `cpu` 等 |
-| `--boundary_tol` | `5` | 子任务边界 F1 的时步容忍窗口 |
-| `--out` | 不保存 | 结果保存为 JSON 文件路径 |
+| `--bench_root` | `dataset/RoboCerebra/RoboCerebraBench` | RoboCerebraBench 目录 |
+| `--task_types` | 全 6 类 | 只评估指定子集，空格分隔 |
+| `--data_root` | — | robocerebra / libero 数据目录 |
+| `--libero_split` | `long` | `spatial`, `object`, `goal`, `long` |
+| `--max_traj` | 全部 | 限制轨迹数（调试用） |
+| `--boundary_tol` | `5` | 子任务边界 F1 容忍窗口（步数） |
+| `--print_tree` | 关闭 | 打印每条轨迹结束时的记忆树 ASCII 结构 |
+| `--out` | 不保存 | 结果保存为 JSON |
 
 ---
 
 ### 结果解读
-
-`robocerebra_bench` 模式下结果 JSON 结构：
-
-```json
-{
-  "checkpoint": "checkpoints/runs/phase3_best",
-  "dataset": "robocerebra_bench",
-  "task_types": ["Ideal", "Memory_Execution", ...],
-  "n_cases": 60,
-  "overall_summary": {
-    "action_l1": 0.0936, "action_l1_std": 0.0287,
-    "subtask_boundary_f1": 0.6539,
-    "prog_monotone_rate": 0.8612
-  },
-  "per_task_type": {
-    "Ideal":      {"n_cases": 10, "metrics": {...}},
-    "Mix":        {"n_cases": 10, "metrics": {...}}
-  },
-  "per_case": [...]
-}
-```
-
-**指标解读**：
 
 | 指标 | 良好范围 | 含义 |
 |---|---|---|
@@ -744,62 +687,39 @@ python eval.py \
 
 ### 1. `NCCL` 通信超时
 
-多卡训练前设置 NCCL 超时和网络接口：
-
 ```bash
-export NCCL_IB_DISABLE=0          # 启用 InfiniBand（若有）
-export NCCL_IB_GID_INDEX=3
+export NCCL_IB_DISABLE=0
 export NCCL_SOCKET_IFNAME=eth0    # 替换为实际网卡名（ip link 查看）
-export NCCL_DEBUG=INFO             # 调试时开启
-export NCCL_TIMEOUT=1800           # 超时时间（秒）
+export NCCL_DEBUG=INFO
+export NCCL_TIMEOUT=1800
 ```
 
 ### 2. Flash Attention 编译失败
 
 ```bash
-# 检查 CUDA 版本与 torch 版本匹配
+# 检查 CUDA 与 torch 版本是否匹配
 python -c "import torch; print(torch.version.cuda)"
 nvcc --version
 
-# 若版本不一致，重装对应 CUDA 版本的 torch
-pip install torch==2.2.0 --index-url https://download.pytorch.org/whl/cu121
-
 # 清理缓存后重新编译
-pip uninstall flash-attn -y
-pip cache purge
+pip uninstall flash-attn -y && pip cache purge
 pip install flash-attn --no-build-isolation
 ```
 
-### 3. DeepSpeed `ds_report` 报算子未编译
+### 3. DeepSpeed 算子未编译
 
 ```bash
-# 手动预编译所有 DeepSpeed CUDA 算子
-python -c "
-from deepspeed.ops.adam import FusedAdam
-from deepspeed.ops.transformer import DeepSpeedTransformerLayer
-print('DeepSpeed ops OK')
-"
-# 或强制构建
+# 强制预编译
 DS_BUILD_OPS=1 DS_BUILD_FUSED_ADAM=1 pip install deepspeed --no-build-isolation
 ```
 
 ### 4. 显存不足（OOM）
 
-按以下顺序逐步降低显存占用：
-
 ```bash
-# 1. 减小 batch_size（configs/default.yaml）
-train:
-  batch_size: 2   # 从 4 降到 2
-
-# 2. 增大 gradient_accumulation_steps（configs/ds_zero2.json）
-"gradient_accumulation_steps": 4
-
-# 3. 切换 ZeRO-3（Phase 3 默认使用）
-bash scripts/train_8gpu.sh 3 configs/default.yaml \
-    --deepspeed_config configs/ds_zero3.json
-
-# 4. 使用更小的 LLM（0.5B 替代 1.5B）
+# 1. 减小 batch_size（对应 yaml 的 train.batch_size: 2）
+# 2. 增大 grad_accum（对应 yaml 的 grad_accum: 4）
+# 3. Phase 2 已默认使用 ZeRO-3，若仍 OOM 可开启 CPU offload（ds_zero3.json）
+# 4. 使用 0.5B 替代 1.5B LLM
 model:
   llm_path: "checkpoints/Qwen2.5-0.5B"
 ```
@@ -807,23 +727,12 @@ model:
 ### 5. 数据加载慢
 
 ```bash
-# 增加 DataLoader workers（configs/default.yaml）
-train:
-  num_workers: 8   # 默认 4，根据 CPU 核心数调整
-
-# 预解压视频到帧图片（可选，绕过 cv2 实时解码）
-# 修改 dataset/robocerebra.py 中的帧读取逻辑即可
+# 增加 DataLoader workers（yaml 的 train.num_workers: 8）
 ```
 
-### 6. 查看训练日志
+### 6. mini-ImageNet 找不到类目录
 
-```bash
-# 日志保存在 logs/ 目录（scripts/train_8gpu.sh 自动创建）
-tail -f logs/phase1_20260331_120000/train.log
-
-# 仅查看损失
-grep "Epoch" logs/phase1_*/train.log
-```
+阶段 a 预训练期望目录结构为 `dataset/mini-imagenet/data/train/<class>/`。若下载来源不同，可通过 `--data_root` 指定实际路径。
 
 ---
 

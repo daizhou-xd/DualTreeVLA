@@ -1,0 +1,72 @@
+# MemoryTreeVLA Pre-training Configuration
+# ─────────────────────────────────────────────────────────────────────────
+# Stage: Pre-training (动作边界检测 + 语义对齐)
+# Dataset: RoboCerebra
+# Losses: L_boundary (BCE) + L_sem (InfoNCE) + L_elev (MSE)
+#   NOTE: FlowMatching损失 (L_flow) 在预训练阶段不使用。
+# Frozen:    LLM, CrossModalFusion, FlowMatchingActionHead
+# Trainable: SGMTS, sem_proj, JumpAwareHead, MLPElevation, TreeSSM
+# ───────────────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────
+# Single GPU:
+#   python pretrain.py --config configs/pretrain.yaml
+# 8-GPU Accelerate:
+#   accelerate launch --config_file configs/accelerate_zero2.yaml \
+#       pretrain.py --config configs/pretrain.yaml
+# ─────────────────────────────────────────────────────────────────────────
+
+mixed_precision: "bf16"     # "bf16" on A100, "fp16" on V100, "no" for debug
+grad_accum: 1
+seed: 42
+
+wandb_project: "MemoryTreeVLA-pretrain"
+
+# ── Data ──────────────────────────────────────────────────────────────────
+data:
+  root:        "dataset/RoboCerebra/RoboCerebra_trainset"
+  scenes:      null          # null = all (coffee_table / kitchen_table / study_table)
+  img_h:       224
+  img_w:       224
+  subsample:   4             # temporal stride (1 = every frame, 4 ≈ 5 Hz)
+  max_seqlen:  64            # max frames per trajectory (OOM guard)
+
+# ── Model ─────────────────────────────────────────────────────────────────
+model:
+  llm_path:    "checkpoints/Qwen2.5-0.5B"
+  # SGMTS预训练权重加载: 先运行 --stage sgmts 在 mini-ImageNet 上训练 SGMTS backbone。
+  # 训练完成后将路径填入 sgmts_ckpt，否则留空不加载。
+  sgmts_ckpt:  null          # e.g. "checkpoints/runs/sgmts/sgmts_best.pt"
+  d:           256
+  d_a:         7
+  d_q:         84
+  d_visual:    256
+  d_ssm:       256
+  d_state:     16
+  patch_size:  16
+  H_a:         16
+  n_ode:       20
+  theta_fuse:  0.65     # 预训练段用较大阈值（嵌入尚未对齐）
+  K_elev:      4
+  delta_w:     0.1
+  tau:         0.1
+
+# ── Training ──────────────────────────────────────────────────────────────
+train:
+  batch_size:    2
+  num_workers:   4
+  epochs:        30
+  lr:            3.0e-4
+  weight_decay:  1.0e-4
+  warmup_ratio:  0.05
+  ckpt_dir:      "checkpoints/runs/pretrain"
+  save_every:    5
+  resume_from:   null        # path to checkpoint to resume from
+
+# ── Loss weights ──────────────────────────────────────────────────────────
+# Only these three losses are used in pre-training.
+# L_flow / L_recon / L_prog / L_align are Phase-1/2 only — do NOT add them here.
+loss:
+  w_boundary:  1.0           # BCE action-mutation boundary detection
+  w_sem:       0.5           # InfoNCE branch-point semantic↔sub-task text
+  w_elev:      0.2           # MSE elevation consistency (abstract ↔ children mean)
+  tau_sem:     0.07          # InfoNCE temperature

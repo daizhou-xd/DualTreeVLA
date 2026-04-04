@@ -1,0 +1,74 @@
+# MemoryTreeVLA Phase 1 Training — FlowMatching Warm-up
+# ─────────────────────────────────────────────────────────────────────────
+# Stage: Phase 1 (FlowMatching warm-up, frozen LLM + pre-trained modules)
+# Dataset: LIBERO (LeRobot parquet format)
+# Losses: L_flow ONLY
+#   NOTE: Semantic losses (L_boundary, L_sem, L_elev) are NOT used here.
+# Frozen: LLM, SGMTS, sem_proj, JumpAwareHead, MLPElevation, TreeSSM
+# Trainable: CrossModalFusion, FlowMatchingActionHead
+# Init from: checkpoints/runs/pretrain/pretrain_best.pt
+# ─────────────────────────────────────────────────────────────────────────
+# 8-GPU Accelerate + ZeRO-2:
+#   accelerate launch --config_file configs/accelerate_zero2.yaml \
+#       train.py --config configs/train_phase1.yaml --phase 1
+# ─────────────────────────────────────────────────────────────────────────
+
+mixed_precision: "bf16"
+grad_accum: 2
+seed: 42
+
+wandb_project: "MemoryTreeVLA-phase1"
+
+# ── Data ──────────────────────────────────────────────────────────────────
+data:
+  # LIBERO datasets (LeRobot v2 parquet + video format)
+  # Download: python scripts/download_data.py --libero
+  # To train on a single subset, set root to one of:
+  #   dataset/LIBERO/libero_10        ← LIBERO-LONG (long-horizon, recommended)
+  #   dataset/LIBERO/libero_spatial
+  #   dataset/LIBERO/libero_object
+  #   dataset/LIBERO/libero_goal
+  # To merge all 4 subsets, use roots in train.py (see LiberoDataset docs).
+  root:        "dataset/LIBERO/libero_10"
+  img_h:       224
+  img_w:       224
+  d_q:         84
+  d_a:         7
+  max_seqlen:  64
+  normalize:   true
+
+# ── Model ─────────────────────────────────────────────────────────────────
+model:
+  llm_path:    "checkpoints/Qwen2.5-0.5B"
+  pretrain_ckpt: "checkpoints/runs/pretrain/pretrain_best.pt"
+  d:           256
+  d_a:         7
+  d_q:         84
+  d_visual:    256
+  d_ssm:       256
+  d_state:     16
+  patch_size:  16
+  H_a:         16
+  n_ode:       20
+  theta_fuse:  0.35     # tighter after pre-training (embeddings now aligned)
+  K_elev:      4
+  delta_w:     0.1
+  tau:         0.1
+
+# ── Training ──────────────────────────────────────────────────────────────
+train:
+  batch_size:    2
+  num_workers:   4
+  epochs:        50
+  lr:            1.0e-4
+  weight_decay:  1.0e-4
+  warmup_ratio:  0.05
+  ckpt_dir:      "checkpoints/runs/phase1"
+  save_every:    5
+  # Load semantic modules from pre-training
+  init_from:     "checkpoints/runs/pretrain/pretrain_best.pt"
+
+# ── Loss weights ──────────────────────────────────────────────────────────
+# Phase 1 uses ONLY L_flow. No semantic losses.
+loss:
+  w_flow:   1.0

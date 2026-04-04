@@ -21,6 +21,8 @@ data:
 # ── Model ─────────────────────────────────────────────────────────
 model:
   llm_path:    "checkpoints/Qwen2.5-0.5B"
+  # SGMTS backbone 预训练权重（先用 --stage sgmts 在 mini-ImageNet 训好后填入）
+  sgmts_ckpt:  null       # e.g. "checkpoints/runs/sgmts/sgmts_best.pt"
   d:           256       # unified embedding dim
   d_a:         7         # action dim (Franka: 6D Δ-pose + gripper)
   d_q:         84        # proprioceptive state dim
@@ -31,9 +33,11 @@ model:
   H_a:         16        # action prediction horizon
   n_ode:       20        # ODE integration steps (inference)
   # Memory tree
-  theta_fuse:  0.35      # semantic distance merge threshold; use ~0.65 for untrained s_proj (Phase 1 cold-start), ~0.35 after Phase 1 when embeddings are coherent
-  K_elev:      4         # children count elevation trigger
+  theta_fuse:  0.35      # 语义距离合并阈值；预训练后约0.35，未对齐时约0.65
+  K_elev:      4         # 保留兼容（elevation 现已每次分支则触发）
   delta_w:     0.1       # importance weight increment per merge
+  mount_tau:      0.4   # 挂载点搜索阈值：余弦距离 >= 此值则在该节点下方挂载
+  max_tree_depth: 4     # 树最大深度（超出则剪枝旧记忆）
   tau:         0.1       # soft-gate temperature
 
 # ── Training ──────────────────────────────────────────────────────

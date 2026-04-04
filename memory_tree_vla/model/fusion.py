@@ -20,7 +20,7 @@ Architecture:
 import torch
 import torch.nn as nn
 
-from models.attn import FlashMHA
+from memory_tree_vla.model.attn import FlashMHA
 
 
 # ================================================================

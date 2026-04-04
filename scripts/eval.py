@@ -134,10 +134,17 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--boundary_tol", type=int, default=5,
                    help="Timestep window for branch-vs-GT-boundary matching "
                         "(RoboCerebra only)")
+    p.add_argument("--theta_fuse", type=float, default=None,
+                   help="Override the memory-tree merge threshold at eval time. "
+                        "Lower values (e.g. 0.05–0.15) cause more branching. "
+                        "Default: use value from config (typically 0.35).")
 
     # Output
     p.add_argument("--out", default=None,
                    help="JSON file to write results (optional)")
+    p.add_argument("--print_tree", action="store_true",
+                   help="Print the memory-tree ASCII structure after each "
+                        "trajectory (useful for verifying semantic elevation)")
 
     return p.parse_args()
 
@@ -145,6 +152,11 @@ def parse_args() -> argparse.Namespace:
 # ================================================================
 #  Config & model loading
 # ================================================================
+
+import sys
+import os
+from pathlib import Path as _P
+sys.path.insert(0, str(_P(__file__).parent.parent))
 
 def load_config(path: str) -> dict:
     with open(path) as f:
@@ -157,7 +169,7 @@ def load_model(ckpt_path: str, cfg: dict, device: torch.device):
     Handles plain .pt (state_dict or full training ckpt) and
     DeepSpeed tag-file directory checkpoints.
     """
-    from models import MemoryTreeVLA
+    from memory_tree_vla.model import MemoryTreeVLA
 
     m_cfg = cfg.get("model", {})
     model = MemoryTreeVLA(
@@ -182,18 +194,28 @@ def load_model(ckpt_path: str, cfg: dict, device: torch.device):
 
     # DeepSpeed checkpoint directory
     if os.path.isdir(ckpt_path):
-        # Gather sharded weight files and merge
-        import glob
-        shard_files = sorted(glob.glob(
-            os.path.join(ckpt_path, "**", "*model_states.pt"), recursive=True
-        ))
-        if not shard_files:
-            raise FileNotFoundError(
-                f"No model_states.pt found in DeepSpeed checkpoint dir: {ckpt_path}"
+        # Try DeepSpeed's official consolidation API first.
+        # This correctly handles both ZeRO-2 and ZeRO-3 (sharded params).
+        try:
+            from deepspeed.utils.zero_to_fp32 import (  # type: ignore[import]
+                get_fp32_state_dict_from_zero_checkpoint,
             )
-        # Load first shard (ZeRO-2: all model params on each rank)
-        state = torch.load(shard_files[0], map_location="cpu")
-        sd = state.get("module", state)
+            print(f"[INFO] Consolidating DeepSpeed ZeRO checkpoint from {ckpt_path} …")
+            sd = get_fp32_state_dict_from_zero_checkpoint(ckpt_path)
+        except Exception as ds_err:
+            # Fallback: ZeRO-2 stores full params in rank-0 shard
+            import glob
+            print(f"[WARN] DeepSpeed consolidation failed ({ds_err}); "
+                  "falling back to rank-0 shard loading (ZeRO-2 only).")
+            shard_files = sorted(glob.glob(
+                os.path.join(ckpt_path, "**", "*model_states.pt"), recursive=True
+            ))
+            if not shard_files:
+                raise FileNotFoundError(
+                    f"No model_states.pt found in DeepSpeed checkpoint dir: {ckpt_path}"
+                )
+            state = torch.load(shard_files[0], map_location="cpu")
+            sd = state.get("module", state)
     else:
         state = torch.load(ckpt_path, map_location="cpu")
         # Training checkpoint wraps state_dict under 'model_state_dict'
@@ -203,7 +225,24 @@ def load_model(ckpt_path: str, cfg: dict, device: torch.device):
             or state
         )
 
-    missing, unexpected = model.load_state_dict(sd, strict=False)
+    # ZeRO-3 stores non-local shard params as shape-[0] placeholders.
+    # Trying to load them into the model raises a "size mismatch" RuntimeError
+    # even with strict=False.  Drop any key whose shape doesn't match the
+    # current model so those parameters keep their initialised values.
+    model_sd = model.state_dict()
+    shape_skipped = []
+    sd_clean: dict = {}
+    for k, v in sd.items():
+        if k in model_sd and v.shape != model_sd[k].shape:
+            shape_skipped.append(f"{k}: ckpt{list(v.shape)} vs model{list(model_sd[k].shape)}")
+        else:
+            sd_clean[k] = v
+    if shape_skipped:
+        print(f"[WARN] Skipping {len(shape_skipped)} shape-mismatched keys "
+              f"(ZeRO-3 placeholders): {shape_skipped[:5]}"
+              f"{'...' if len(shape_skipped) > 5 else ''}")
+
+    missing, unexpected = model.load_state_dict(sd_clean, strict=False)
     if missing:
         print(f"[WARN] Missing keys ({len(missing)}): {missing[:5]}{'...' if len(missing)>5 else ''}")
     if unexpected:
@@ -211,6 +250,15 @@ def load_model(ckpt_path: str, cfg: dict, device: torch.device):
 
     model.to(device)
     model.eval()
+
+    # ── sem_proj health check ────────────────────────────────────────
+    sem_norms = [p.data.norm().item() for p in model.sem_proj.parameters()]
+    if sem_norms:
+        mean_n = sum(sem_norms) / len(sem_norms)
+        print(f"  [DIAG] sem_proj weight norms: mean={mean_n:.3f}")
+        if mean_n < 0.1:
+            print("  [WARN] sem_proj weights are near-zero — L_sem alignment may collapse.")
+
     return model
 
 
@@ -243,11 +291,11 @@ def compute_prog_monotone_rate(tree) -> float:
     if tree.root_id is None or len(tree.nodes) < 2:
         return 1.0
 
-    # Collect leaf semantics as task-goal proxy
+    # Collect leaf z_v as task-goal proxy (visual embedding of terminal states)
     leaf_s = [
-        tree.nodes[nid].s.float()
+        tree.nodes[nid].z_v.float()
         for nid in tree.nodes
-        if tree.nodes[nid].is_leaf()
+        if tree.nodes[nid].is_leaf() and tree.nodes[nid].z_v is not None
     ]
     if not leaf_s:
         return 1.0
@@ -261,11 +309,25 @@ def compute_prog_monotone_rate(tree) -> float:
     for anc_id, desc_id in pairs:
         if anc_id not in tree.nodes or desc_id not in tree.nodes:
             continue
-        s_a = F.normalize(tree.nodes[anc_id].s.float(),  dim=-1)
-        s_d = F.normalize(tree.nodes[desc_id].s.float(), dim=-1)
+        node_a = tree.nodes[anc_id]
+        node_d = tree.nodes[desc_id]
+        # Use z_v for leaves, s for abstract nodes (project to same space)
+        vec_a = node_a.z_v.float() if node_a.is_leaf() else (
+            node_a.s.float() if node_a.s is not None else None)
+        vec_d = node_d.z_v.float() if node_d.is_leaf() else (
+            node_d.s.float() if node_d.s is not None else None)
+        if vec_a is None or vec_d is None:
+            continue
+        # Truncate/pad to goal dimension
+        d_goal = goal.shape[0]
+        if vec_a.shape[0] != d_goal:
+            vec_a = F.pad(vec_a[:d_goal], (0, max(0, d_goal - vec_a.shape[0])))
+        if vec_d.shape[0] != d_goal:
+            vec_d = F.pad(vec_d[:d_goal], (0, max(0, d_goal - vec_d.shape[0])))
+        s_a = F.normalize(vec_a, dim=-1)
+        s_d = F.normalize(vec_d, dim=-1)
         dist_a = 1.0 - (s_a * goal).sum().item()
         dist_d = 1.0 - (s_d * goal).sum().item()
-        # Correct if ancestor is farther (or equal within epsilon)
         if dist_a >= dist_d - 1e-4:
             correct += 1
 
@@ -306,6 +368,106 @@ def f1_from_counts(tp: int, fp: int, fn: int) -> float:
 
 
 # ================================================================
+#  Tree visualisation
+# ================================================================
+
+def format_tree(
+    tree,
+    branch_steps: List[int],
+    header: str = "",
+) -> str:
+    """
+    Render the HierarchicalMemoryTree as an ASCII tree.
+
+    Each node line shows:
+        <prefix><marker> [id:<nid>] n=<merge_cnt> w=<weight:.2f>
+                         |s|=<||s||:.3f>  elev=<yes/no>
+
+    Elevation nodes are identified as non-leaf nodes that were NOT in the
+    original BFS sequence before their children (i.e. abstract parent added
+    by semantic_elevation).  We detect them by checking whether the node's
+    children count > 0 AND the node has a parent (elevated nodes are always
+    interior, non-root).
+
+    branch_steps  : timesteps at which a branch was created (from evaluate_trajectory)
+    """
+    if tree.root_id is None:
+        return "<empty tree>"
+
+    lines: List[str] = []
+    if header:
+        lines.append(header)
+
+    n_nodes     = tree.size()
+    n_elevations = getattr(tree, "_elevation_count", 0)
+    max_depth   = tree_max_depth(tree)
+    lines.append(
+        f"  nodes={n_nodes}  depth={max_depth}  "
+        f"branches={len(branch_steps)}  elevations={n_elevations}"
+    )
+    lines.append("")
+
+    def _render(nid: int, prefix: str, is_last: bool) -> None:
+        node = tree.nodes[nid]
+
+        connector = "└── " if is_last else "├── "
+        child_prefix = prefix + ("    " if is_last else "│   ")
+
+        # Identify elevated nodes: interior (has children) and non-root
+        is_elev = (
+            not node.is_leaf()
+            and not node.is_root()
+            and node.parent_id is not None
+        )
+        # Identify active node
+        is_active = (nid == tree.active_id)
+
+        # Merge count / visit count: leaf nodes track a_hist length; abstract track children count
+        if node.is_leaf():
+            n_merge = len(node.a_hist) if node.a_hist else 0
+        else:
+            n_merge = len(node.children_ids)
+        # Semantic norm: leaf nodes have z_v (visual), abstract have s (semantic)
+        if node.is_leaf():
+            s_norm = node.z_v.float().norm().item() if node.z_v is not None else 0.0
+        else:
+            s_norm = node.s.float().norm().item() if node.s is not None else 0.0
+        # Importance weight
+        w = node.w
+        # Children count
+        n_ch = len(node.children_ids)
+
+        tags: List[str] = []
+        if node.is_root():
+            tags.append("ROOT")
+        if is_elev:
+            tags.append("ELEV")
+        if is_active:
+            tags.append("ACTIVE")
+        if node.is_leaf():
+            tags.append("leaf")
+        tag_str = " [" + ",".join(tags) + "]" if tags else ""
+
+        lines.append(
+            f"{prefix}{connector}[{nid:>3}]{tag_str}"
+            f"  n={n_merge:>3}  w={w:.2f}  |s|={s_norm:.3f}  children={n_ch}"
+        )
+
+        children = node.children_ids
+        for i, cid in enumerate(children):
+            _render(cid, child_prefix, is_last=(i == len(children) - 1))
+
+    _render(tree.root_id, prefix="", is_last=True)
+
+    # Branch timeline
+    if branch_steps:
+        lines.append("")
+        lines.append(f"  Branch timesteps: {branch_steps}")
+
+    return "\n".join(lines)
+
+
+# ================================================================
 #  Single-trajectory evaluation
 # ================================================================
 
@@ -320,6 +482,8 @@ def evaluate_trajectory(
     has_subtask_labels: bool = False,
     subtask_ids: Optional[torch.Tensor] = None,   # (T,) int
     boundary_tol: int = 5,
+    print_tree: bool = False,
+    traj_label: str = "",
 ) -> Dict:
     """
     Run one trajectory through model.step(), collecting per-step metrics.
@@ -329,38 +493,89 @@ def evaluate_trajectory(
     if T == 0:
         return {}
 
+    # Pad proprioception states to the model's expected d_q if necessary
+    # (e.g. RoboCerebraBench states are dim-71 while training used dim-84)
+    try:
+        model_dq: int = model.fusion.prop_proj.weight.shape[1]
+    except AttributeError:
+        model_dq = states.shape[-1]
+    if states.shape[-1] < model_dq:
+        pad = torch.zeros(T, model_dq - states.shape[-1], dtype=states.dtype)
+        states = torch.cat([states, pad], dim=-1)
+    elif states.shape[-1] > model_dq:
+        states = states[:, :model_dq]
+
     model.reset_trees(batch_size=1)
     tree = model.get_tree(0)
-    # Attach elevation counter
+    # Attach elevation counter (incremented here, not inside step())
     tree._elevation_count = 0
+    # Monkey-patch insert() to record each timestep's cosine distance d_t.
+    # This is the single number that decides merge vs. branch — logging it
+    # lets us check whether theta_fuse needs tuning.
+    tree._dt_log = []
+    _orig_insert = tree.insert.__func__   # unbound method
+    def _patched_insert(self, z_v, a, force_branch: bool):
+        # Snapshot d_t (cosine distance) before calling original insert
+        active_node = self.nodes.get(self.active_id)
+        if active_node is not None and not active_node.is_leaf() and active_node.s is not None:
+            import torch.nn.functional as _F
+            import torch as _torch
+            # Use z_v distance as a proxy for semantic change
+            s_before = active_node.s.float()
+            d_cosine = (1.0 - _F.cosine_similarity(
+                z_v.float().unsqueeze(0),
+                s_before.unsqueeze(0),
+            ).item())
+            self._dt_log.append(d_cosine)
+        return _orig_insert(self, z_v, a, force_branch)
+    import types
+    tree.insert = types.MethodType(_patched_insert, tree)
+
+    # Helper to snapshot active-node state before each insert (kept for compat)
+    def _snapshot_s(t):
+        pass  # no-op: new node design doesn't store s on leaves
 
     l1_errors, l2_errors = [], []
-    branch_steps: List[int] = []   # timesteps where a branch was created
-    prev_size = 0
+    branch_steps: List[int] = []   # timesteps where a real branch was created
+    merge_count: int = 0           # timesteps that triggered a merge (no new node)
+    dt_values: List[float] = []    # cosine distances between consecutive s embeddings
     a_prev = None
 
     for t in range(T):
         img_t = frames[t].unsqueeze(0).to(device)     # (1, 3, H, W)
         q_t   = states[t].unsqueeze(0).to(device)     # (1, d_q)
 
+        # Snapshot active-node s before model.step() calls insert() internally
+        _snapshot_s(t)
+
         # Snapshot tree size before step
         size_before = tree.size()
 
-        # Predict action chunk
+        # Predict action chunk (also updates the memory tree internally)
         a_chunk = model.step(img_t, instruction, q_t, a_prev)   # (1, H_a, d_a)
 
-        # Track new branches (size increased by 1 → branch, not elevation)
+        # ── Track tree structural changes ──────────────────────────
         size_after = tree.size()
-        if size_after > size_before:
-            branch_steps.append(t)
+        delta = size_after - size_before
 
-        # Track elevations via elevation_pending_parent
-        # (elevation may add an extra node, total size can jump by 2)
-        if tree.elevation_pending_parent is not None:
-            tree._elevation_count += 1
-            # The model's step() doesn't clear elevation_pending_parent
-            # (bug in original code — we log it but don't re-trigger it)
-            tree.elevation_pending_parent = None
+        # Recover the d_t that insert() just computed from the patched list.
+        if hasattr(tree, "_dt_log") and tree._dt_log:
+            dt_values.append(tree._dt_log[-1])
+
+        if size_before == 0:
+            # Root creation — not a real branch event, skip.
+            pass
+        elif delta == 0:
+            # Merge: active node updated in-place, no new node.
+            merge_count += 1
+        else:
+            # delta >= 1: a new leaf was created (branch)
+            branch_steps.append(t)
+            if delta >= 2:
+                # semantic_elevation ran and added an abstract parent node too.
+                # model.step() clears elevation_pending_parent after handling,
+                # so we detect it purely via the extra +1 size jump.
+                tree._elevation_count += 1
 
         # Action L1 / L2  (compare first predicted step vs GT action)
         a_pred_first = a_chunk[0, 0].cpu()    # (d_a,)
@@ -372,13 +587,42 @@ def evaluate_trajectory(
         a_prev = actions[t].unsqueeze(0).to(device)
 
     # --- Tree stats -------------------------------------------------------
+    # Summarise d_t distribution for diagnosing theta_fuse tuning needs.
+    dt_summary: Dict[str, float] = {}
+    if dt_values:
+        dt_sorted = sorted(dt_values)
+        n_dt = len(dt_sorted)
+        dt_summary = {
+            "dt_mean":   sum(dt_values) / n_dt,
+            "dt_max":    dt_sorted[-1],
+            "dt_p90":    dt_sorted[int(0.9 * n_dt)],
+            "dt_p50":    dt_sorted[n_dt // 2],
+        }
+
+    # s_embed_spread: mean pairwise cosine distance between s vectors sampled
+    # across the trajectory.  Near 0 = collapse; healthy = 0.1 ~ 1.0.
+    s_embed_spread = 0.0
+    s_log = getattr(tree, "_s_log", [])
+    if len(s_log) > 1:
+        n_sample = min(len(s_log), 64)
+        step = max(1, len(s_log) // n_sample)
+        s_mat = torch.stack(s_log[::step][:n_sample])  # (N, d)
+        s_mat_n = F.normalize(s_mat.float(), dim=-1)
+        sim_mat = s_mat_n @ s_mat_n.T                  # (N, N)
+        N = sim_mat.shape[0]
+        mask = torch.triu(torch.ones(N, N, dtype=torch.bool), diagonal=1)
+        s_embed_spread = float((1.0 - sim_mat[mask]).mean().item())
+
     result: Dict = {
-        "action_l1":      float(sum(l1_errors) / max(len(l1_errors), 1)),
-        "action_l2":      float(sum(l2_errors) / max(len(l2_errors), 1)),
-        "tree_nodes":     float(tree.size()),
-        "tree_depth":     float(tree_max_depth(tree)),
-        "tree_branches":  float(len(branch_steps)),
-        "tree_elevations":float(tree._elevation_count),
+        "action_l1":        float(sum(l1_errors) / max(len(l1_errors), 1)),
+        "action_l2":        float(sum(l2_errors) / max(len(l2_errors), 1)),
+        "tree_nodes":       float(tree.size()),
+        "tree_depth":       float(tree_max_depth(tree)),
+        "tree_branches":    float(len(branch_steps)),
+        "tree_elevations":  float(tree._elevation_count),
+        "merge_rate":       float(merge_count / max(T - 1, 1)),
+        "s_embed_spread":   s_embed_spread,
+        **dt_summary,
     }
 
     # --- Subtask-specific metrics (RoboCerebra) ---------------------------
@@ -400,6 +644,13 @@ def evaluate_trajectory(
         # Progress monotonicity
         result["prog_monotone_rate"] = compute_prog_monotone_rate(tree)
 
+    # ── Optional tree dump ────────────────────────────────────────────
+    if print_tree:
+        label = traj_label or instruction[:60]
+        header = f"\n{'─' * 64}\n  Tree after: {label}"
+        print(format_tree(tree, branch_steps, header=header))
+        print(f"{'─' * 64}")
+
     return result
 
 
@@ -415,6 +666,7 @@ def _eval_trajectories(
     has_subtask_labels: bool,
     boundary_tol: int,
     show_task_type: bool = False,
+    print_tree: bool = False,
 ) -> List[Dict]:
     """Iterate over dataset, run evaluate_trajectory, return per-traj results."""
     all_results: List[Dict] = []
@@ -429,6 +681,14 @@ def _eval_trajectories(
         instruction = sample["instruction"]
         subtask_ids = sample.get("subtask_ids")  # (T,) or None
 
+        if show_task_type:
+            traj_label = (
+                f"{sample.get('task_type', '')} / "
+                f"{sample.get('case_name', '')}  "
+                f"{instruction[:40]}"
+            )
+        else:
+            traj_label = f"traj {idx}  {instruction[:55]}"
         traj_result = evaluate_trajectory(
             model              = model,
             frames             = frames,
@@ -439,6 +699,8 @@ def _eval_trajectories(
             has_subtask_labels = has_subtask_labels,
             subtask_ids        = subtask_ids,
             boundary_tol       = boundary_tol,
+            print_tree         = print_tree,
+            traj_label         = traj_label,
         )
         traj_result["trajectory_idx"] = idx
         traj_result["instruction"]    = instruction
@@ -481,6 +743,37 @@ def _print_summary_table(title: str, summary: Dict[str, float]) -> None:
             print(f"  {k:<33} {v:>10.4f}{std_str}")
     print(f"{'=' * w}")
 
+def _print_semantic_diagnosis(summary: Dict[str, float]) -> None:
+    """Print a clear diagnosis when semantic embedding collapse is detected."""
+    dt_mean      = summary.get("dt_mean",       1.0)
+    dt_max       = summary.get("dt_max",        1.0)
+    s_spread     = summary.get("s_embed_spread", 1.0)
+    merge_rate   = summary.get("merge_rate",     0.0)
+    theta_fuse   = 0.35   # informational only
+
+    if dt_max >= 0.05:
+        return   # looks healthy, no diagnosis needed
+
+    print("\n" + "!" * 64)
+    print("  SEMANTIC EMBEDDING COLLAPSE DETECTED")
+    print("!" * 64)
+    print(f"  dt_mean={dt_mean:.5f}  dt_max={dt_max:.5f}  "
+          f"s_embed_spread={s_spread:.4f}")
+    print(f"  theta_fuse={theta_fuse}  →  tree branches NEVER (merge_rate={merge_rate:.3f})")
+    print()
+    print("  The model's 's' embeddings are nearly identical across all frames.")
+    print("  Likely causes (check in order):")
+    print("  1. Phase 1 L_sem loss was zero / too small → s_proj never learned")
+    print("     contrast.  Check training logs for 'L_sem' column.")
+    print("  2. Checkpoint has MISSING s_proj weights (loaded as random init).")
+    print("     Check '[WARN] Missing keys' above — if 's_proj' appears there,")
+    print("     the Phase 3 ZeRO-3 checkpoint did not save it.")
+    print("  3. Phase 3 LLM joint fine-tuning destroyed semantic alignment.")
+    print("     Try an earlier checkpoint to compare:")
+    print("       --ckpt checkpoints/runs/phase1_best")
+    print("       --ckpt checkpoints/runs/phase2_best")
+    print("  4. s_proj weight norms are near-zero (see [DIAG] lines above).")
+    print("!" * 64)
 
 # ================================================================
 #  Main evaluation loop
@@ -502,6 +795,12 @@ def run_evaluation(args: argparse.Namespace):
     print(f"Loading model from {args.ckpt} ...")
     model = load_model(args.ckpt, cfg, device)
 
+    # ── Override tree theta_fuse if requested ────────────────────────
+    if args.theta_fuse is not None:
+        old_theta = model._tree_cfg.get("theta_fuse", "?")
+        model._tree_cfg["theta_fuse"] = args.theta_fuse
+        print(f"[INFO] theta_fuse overridden: {old_theta} → {args.theta_fuse}")
+
     # ── Dispatch per dataset mode ────────────────────────────────────
     if args.dataset == "robocerebra_bench":
         return _run_bench_evaluation(args, cfg, model, device,
@@ -514,7 +813,7 @@ def run_evaluation(args: argparse.Namespace):
     if args.dataset == "robocerebra":
         if args.data_root is None:
             raise ValueError("--data_root is required for dataset=robocerebra")
-        from dataset import RoboCerebraDataset
+        from memory_tree_vla.dataset import RoboCerebraDataset
         ds = RoboCerebraDataset(
             root       = args.data_root,
             scenes     = args.scenes,
@@ -526,13 +825,11 @@ def run_evaluation(args: argparse.Namespace):
     else:   # libero
         if args.data_root is None:
             raise ValueError("--data_root is required for dataset=libero")
-        from dataset.libero import LIBERODataset
-        ds = LIBERODataset(
+        from memory_tree_vla.dataset.libero import LiberoDataset
+        ds = LiberoDataset(
             root       = args.data_root,
-            split      = args.libero_split,
             img_h      = data_cfg.get("img_h", 224),
             img_w      = data_cfg.get("img_w", 224),
-            subsample  = subsample,
             max_seqlen = max_seqlen,
             d_q        = cfg.get("model", {}).get("d_q", 84),
         )
@@ -546,10 +843,12 @@ def run_evaluation(args: argparse.Namespace):
         model, ds, n_traj, device,
         has_subtask_labels=has_subtask_labels,
         boundary_tol=args.boundary_tol,
+        print_tree=args.print_tree,
     )
 
     summary = aggregate_results(all_results, has_subtask_labels)
     _print_summary_table("RESULTS", summary)
+    _print_semantic_diagnosis(summary)
 
     if args.out:
         out_path = Path(args.out)
@@ -602,7 +901,7 @@ def _run_bench_evaluation(
       subtask_boundary_f1 / subtask_sr
       prog_monotone_rate              — subtask-aware metrics
     """
-    from dataset.robocerebra_bench import (
+    from memory_tree_vla.dataset.robocerebra_bench import (
         RoboCerebraBenchDataset,
         BENCH_TASK_TYPES,
     )
@@ -638,8 +937,7 @@ def _run_bench_evaluation(
         model, full_ds, n_total, device,
         has_subtask_labels=True,   # bench always has step annotations
         boundary_tol=args.boundary_tol,
-        show_task_type=True,
-    )
+        show_task_type=True,        print_tree=args.print_tree,    )
 
     # ── Per-task-type aggregation ─────────────────────────────────────
     effective_task_types = task_types or BENCH_TASK_TYPES
@@ -671,6 +969,7 @@ def _run_bench_evaluation(
     # ── Overall summary ───────────────────────────────────────────────
     overall = aggregate_results(all_results, has_subtask_labels=True)
     _print_summary_table("OVERALL SUMMARY", overall)
+    _print_semantic_diagnosis(overall)
 
     # ── Save ──────────────────────────────────────────────────────────
     if args.out:

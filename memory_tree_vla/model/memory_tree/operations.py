@@ -1,12 +1,10 @@
 """
 Tree operations: Reinforcement, Semantic Elevation, Pruning.
-CONSTRUCTION.md Section 3.4
 """
 from typing import Dict, List, Optional
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 
 from .node import MemoryNode
 from .tree import HierarchicalMemoryTree
@@ -18,47 +16,21 @@ from .tree import HierarchicalMemoryTree
 
 def reinforce(
     tree: HierarchicalMemoryTree,
-    grad_norms: Dict[int, float],   # {node_id: ||∇_{Φ_C} L||_2}
+    grad_norms: Dict[int, float],
     eta: float = 0.01,
     theta_grad: float = 0.1,
-    alpha_ema: float = 0.05,
-    tau_task: float = 0.1,
-    phi_query: Optional[torch.Tensor] = None,
-    phi_updates: Optional[Dict[int, torch.Tensor]] = None,
 ):
     """
-    (a) Gradient-driven weight update:
-        w_C ← w_C + η · ‖∇Φ_C L‖₂ · 1[‖∇‖ > θ_grad]
-    (b) EMA + task-weighted representation update (if phi_updates provided):
-        Φ_C ← (1-α)Φ_C + α · Σ w_i^task Φ_i / Σ w_i^task
+    梯度驱动的节点权重更新:
+        w_i ← w_i + η · ‖∇L‖₂   if  ‖∇L‖₂ > θ_grad
+
+    只更新权重，不修改嵌入（叶子/抽象节点的嵌入分别由 Welford 和 MLPElevation 管理）。
     """
-    # (a) gradient-driven weight update
     for node_id, grad_norm in grad_norms.items():
         if node_id not in tree.nodes:
             continue
         if grad_norm > theta_grad:
             tree.nodes[node_id].w += eta * grad_norm
-
-    # (b) EMA task-weighted representation update
-    if phi_updates is None or phi_query is None:
-        return
-
-    # compute task-relevance weights for all candidate nodes
-    node_ids = list(phi_updates.keys())
-    phis = torch.stack([phi_updates[nid] for nid in node_ids], dim=0)  # (N, d)
-    phi_query_n = F.normalize(phi_query.float().unsqueeze(0), dim=-1)   # (1, d)
-    phis_n      = F.normalize(phis.float(), dim=-1)                      # (N, d)
-    sims = (phis_n @ phi_query_n.T).squeeze(-1)                          # (N,)
-    w_task = torch.softmax(sims / tau_task, dim=0)                        # (N,)
-
-    # weighted mean of new representations
-    phi_mean = (w_task.unsqueeze(1) * phis).sum(0)                        # (d,)
-
-    for node_id in node_ids:
-        if node_id not in tree.nodes:
-            continue
-        node = tree.nodes[node_id]
-        node.s = ((1 - alpha_ema) * node.s.float() + alpha_ema * phi_mean).to(node.s.dtype)
 
 
 # ======================================================================= #
@@ -67,23 +39,27 @@ def reinforce(
 
 class MLPElevation(nn.Module):
     """
-    Small MLP that maps weighted-pooled [z_v; s] → s_abs for a new abstract
-    parent node v_abs.  Section 3.4 Operation ②.
+    语义提升 MLP：对叶子子节点的 z_v 加权池化后生成抽象父节点的语义嵌入 s_abs。
+
+    输入:  z_pool (d,)  — 叶子子节点 z_v 的加权均值
+    输出:  s_abs  (d,)  — 抽象节点语义嵌入
+
+    注意：输入为 d 维（仅视觉），不再拼接语义嵌入（叶子节点不存 s）。
     """
 
     def __init__(self, d: int, hidden: int = None):
         super().__init__()
         hidden = hidden or d * 2
         self.net = nn.Sequential(
-            nn.Linear(d * 2, hidden),
+            nn.Linear(d, hidden),
             nn.GELU(),
             nn.Linear(hidden, d),
             nn.LayerNorm(d),
         )
 
-    def forward(self, z_pool: torch.Tensor, s_pool: torch.Tensor) -> torch.Tensor:
-        """z_pool, s_pool: (d,) each → s_abs: (d,)"""
-        return self.net(torch.cat([z_pool, s_pool], dim=-1))
+    def forward(self, z_pool: torch.Tensor) -> torch.Tensor:
+        """z_pool: (d,) → s_abs: (d,)"""
+        return self.net(z_pool)
 
 
 def semantic_elevation(
@@ -93,15 +69,16 @@ def semantic_elevation(
     device: torch.device = torch.device("cpu"),
 ) -> Optional[int]:
     """
-    Trigger semantic elevation on v_p = tree.nodes[parent_id].
+    在 parent_id 节点上触发语义提升。
 
-    Selects the top-⌊K/2⌋ children by importance weight as group G,
-    creates v_abs between v_p and G.  Section 3.4 Operation ②.
+    从其叶子子节点中按权重选出 top-⌊K/2⌋ 个作为组 G，
+    用 MLPElevation(z_pool) 生成抽象节点 v_abs，插入在 parent 与 G 之间。
 
-    Returns the new v_abs node_id, or None if elevation was skipped.
+    返回 v_abs 的 node_id，若跳过则返回 None。
     """
     v_p = tree.nodes[parent_id]
-    children = v_p.children_ids
+    children = [nid for nid in v_p.children_ids
+                if tree.nodes[nid].is_leaf()]       # 只提升叶子子节点
 
     if len(children) < 2:
         return None
@@ -109,51 +86,88 @@ def semantic_elevation(
     K = len(children)
     group_size = max(2, K // 2)
 
-    # Sort children by weight, select top group_size
+    # 按权重降序排列，选 top group_size
     sorted_children = sorted(children, key=lambda nid: tree.nodes[nid].w, reverse=True)
     G = sorted_children[:group_size]
 
-    # Weighted pool z_v and s over G
+    # 加权池化叶子节点的 z_v
     ws = torch.tensor([tree.nodes[nid].w for nid in G], dtype=torch.float, device=device)
     ws = ws / ws.sum()
 
     z_pool = sum(ws[i] * tree.nodes[nid].z_v.to(device) for i, nid in enumerate(G))
-    s_pool = sum(ws[i] * tree.nodes[nid].s.to(device)   for i, nid in enumerate(G))
 
     with torch.no_grad():
-        s_abs = mlp_elev(z_pool.float(), s_pool.float())
+        s_abs = mlp_elev(z_pool.float())
 
-    # Representative z_v and q from highest-weight node in G
-    top_nid = G[0]
-    z_abs = tree.nodes[top_nid].z_v.clone()
-    q_abs = tree.nodes[top_nid].q.clone()
     w_abs = sum(tree.nodes[nid].w for nid in G)
-    n_abs = sum(tree.nodes[nid].n for nid in G)
 
-    # Create v_abs
+    # 创建抽象节点 v_abs — 只存 s 和 w，不存 z_v 或 a_hist
     abs_id = tree.alloc_id()
     v_abs = MemoryNode(
         node_id=abs_id,
-        z_v=z_abs,
-        A=[tree.nodes[top_nid].a_last.clone()],
-        q=q_abs,
         s=s_abs.detach().cpu(),
-        n=n_abs,
         w=w_abs,
         parent_id=parent_id,
         children_ids=list(G),
     )
     tree.add_node(v_abs)
 
-    # Re-wire: v_p's children list replaces G with v_abs
+    # 重连：parent 的 children 列表中用 v_abs 替换 G
     v_p.children_ids = [nid for nid in v_p.children_ids if nid not in G]
     v_p.children_ids.append(abs_id)
 
-    # Update parent pointers of G members
+    # 更新 G 成员的 parent 指针
     for nid in G:
         tree.nodes[nid].parent_id = abs_id
 
     return abs_id
+
+
+def propagate_elevation_to_root(
+    tree: HierarchicalMemoryTree,
+    start_id: int,
+    mlp_elev: MLPElevation,
+    device: torch.device = torch.device("cpu"),
+):
+    """
+    从 start_id 开始沿父链向上，逐节点更新每个抽象节点的语义嵌入 s，直至根节点。
+
+    每个抽象节点的 s 由其**所有直接子节点**的嵌入加权池化后经 MLPElevation 所得：
+      - 叶子子节点 → 提供 z_v
+      - 抽象子节点 → 提供 s（已由下层向上更新过的最新值）
+
+    自下而上保证每一层用的都是已更新的子层嵌入，避免使用过期语义做高层概括。
+    """
+    current_id = start_id
+    while current_id is not None:
+        node = tree.nodes[current_id]
+        if node.is_leaf() or not node.children_ids:
+            current_id = node.parent_id
+            continue
+
+        embeds: list = []
+        weights: list = []
+        for cid in node.children_ids:
+            if cid not in tree.nodes:
+                continue
+            child = tree.nodes[cid]
+            if child.is_leaf():
+                if child.z_v is not None:
+                    embeds.append(child.z_v.float())
+                    weights.append(child.w)
+            else:
+                if child.s is not None:
+                    embeds.append(child.s.float())
+                    weights.append(child.w)
+
+        if embeds:
+            wt = torch.tensor(weights, dtype=torch.float)
+            wt = wt / wt.sum()
+            z_pool = (torch.stack(embeds) * wt.unsqueeze(1)).sum(0).to(device)
+            with torch.no_grad():
+                node.s = mlp_elev(z_pool.float()).detach().cpu()
+
+        current_id = node.parent_id
 
 
 # ======================================================================= #
@@ -165,10 +179,8 @@ def prune(
     theta_w: float = 0.3,
 ) -> List[int]:
     """
-    Remove leaf nodes with w_i < theta_w.  Section 3.4 Operation ③.
-    Iterates until no more leaves can be pruned (cascading effect).
-
-    Returns list of pruned node_ids.
+    删除权重 w_i < theta_w 的叶子节点（级联删除）。
+    返回已删除的 node_id 列表。
     """
     pruned: List[int] = []
 
@@ -178,10 +190,8 @@ def prune(
         for node_id in list(tree.nodes.keys()):
             node = tree.nodes[node_id]
             if node.is_leaf() and node.w < theta_w and not node.is_root():
-                # Remove from parent's children list
                 par = tree.nodes[node.parent_id]
                 par.children_ids.remove(node_id)
-                # If active node was pruned, fall back to its parent
                 if tree.active_id == node_id:
                     tree.active_id = node.parent_id
                 del tree.nodes[node_id]

@@ -21,7 +21,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from models.attn import FlashMHA
+from memory_tree_vla.model.attn import FlashMHA
 
 
 # ================================================================

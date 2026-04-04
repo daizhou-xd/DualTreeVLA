@@ -1,0 +1,66 @@
+# MemoryTreeVLA Phase 2 Training — Full Fine-tuning
+# ─────────────────────────────────────────────────────────────────────────
+# Stage: Phase 2 (full fine-tuning, all modules trainable)
+# Dataset: LIBERO (same as Phase 1)
+# Losses: L_flow ONLY
+#   NOTE: Semantic losses are NOT reintroduced here.
+# Frozen: nothing (LLM trained at 0.1× LR via param groups)
+# Trainable: all modules
+# Init from: checkpoints/runs/phase1/phase1_best.pt
+# ─────────────────────────────────────────────────────────────────────────
+# 8-GPU Accelerate + ZeRO-3 (larger model state):
+#   accelerate launch --config_file configs/accelerate_zero3.yaml \
+#       train.py --config configs/train_phase2.yaml --phase 2
+# ─────────────────────────────────────────────────────────────────────────
+
+mixed_precision: "bf16"
+grad_accum: 4
+seed: 42
+
+wandb_project: "MemoryTreeVLA-phase2"
+
+# ── Data ──────────────────────────────────────────────────────────────────
+data:
+  # Same LIBERO datasets as Phase 1 (LeRobot v2 parquet + video format)
+  # Download: python scripts/download_data.py --libero
+  root:        "dataset/LIBERO/libero_10"
+  img_h:       224
+  img_w:       224
+  d_q:         84
+  d_a:         7
+  max_seqlen:  128       # longer sequences for memory tree reinforcement
+  normalize:   true
+
+# ── Model ─────────────────────────────────────────────────────────────────
+model:
+  llm_path:    "checkpoints/Qwen2.5-1.5B-Instruct"  # upgrade to stronger LLM
+  d:           256
+  d_a:         7
+  d_q:         84
+  d_visual:    256
+  d_ssm:       256
+  d_state:     16
+  patch_size:  16
+  H_a:         16
+  n_ode:       20
+  theta_fuse:  0.35
+  K_elev:      4
+  delta_w:     0.1
+  tau:         0.1
+
+# ── Training ──────────────────────────────────────────────────────────────
+train:
+  batch_size:    1       # larger sequences, smaller batch
+  num_workers:   4
+  epochs:        30
+  lr:            3.0e-5  # lower LR for fine-tuning
+  weight_decay:  1.0e-4
+  warmup_ratio:  0.03
+  ckpt_dir:      "checkpoints/runs/phase2"
+  save_every:    5
+  init_from:     "checkpoints/runs/phase1/phase1_best.pt"
+
+# ── Loss weights ──────────────────────────────────────────────────────────
+# Phase 2 uses ONLY L_flow. No semantic losses.
+loss:
+  w_flow:   1.0
