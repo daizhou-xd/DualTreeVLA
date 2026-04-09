@@ -1,4 +1,4 @@
-# MemoryTreeVLA Pre-training Configuration
+﻿# DualTreeVLA Pre-training Configuration
 # ─────────────────────────────────────────────────────────────────────────
 # Stage: Pre-training (动作边界检测 + 语义对齐)
 # Dataset: RoboCerebra
@@ -19,7 +19,7 @@ mixed_precision: "bf16"     # "bf16" on A100, "fp16" on V100, "no" for debug
 grad_accum: 1
 seed: 42
 
-wandb_project: "MemoryTreeVLA-pretrain"
+wandb_project: "DualTreeVLA-pretrain"
 
 # ── Data ──────────────────────────────────────────────────────────────────
 data:
@@ -33,9 +33,10 @@ data:
 # ── Model ─────────────────────────────────────────────────────────────────
 model:
   llm_path:    "checkpoints/Qwen2.5-0.5B"
-  # SGMTS预训练权重加载: 先运行 --stage sgmts 在 mini-ImageNet 上训练 SGMTS backbone。
-  # 训练完成后将路径填入 sgmts_ckpt，否则留空不加载。
-  sgmts_ckpt:  null          # e.g. "checkpoints/runs/sgmts/sgmts_best.pt"
+  # CLIP视觉骨干（推荐，替代 mini-imagenet 预训练阶段）:
+  #   使用冻结 CLIP ViT 作为 patch 特征提取器，直接利用 CLIP 跨模态预训练语义。
+  #   填入 HuggingFace 模型 ID（需提前下载）；留空则使用轻量 PatchCNN fallback。
+  clip_model_name: "checkpoints/CLIP/clip-vit-base-patch16"
   d:           256
   d_a:         7
   d_q:         84

@@ -1,4 +1,4 @@
-# MemoryTreeVLA Phase 2 Training — Full Fine-tuning
+﻿# DualTreeVLA Phase 2 Training — Full Fine-tuning
 # ─────────────────────────────────────────────────────────────────────────
 # Stage: Phase 2 (full fine-tuning, all modules trainable)
 # Dataset: LIBERO (same as Phase 1)
@@ -17,7 +17,7 @@ mixed_precision: "bf16"
 grad_accum: 4
 seed: 42
 
-wandb_project: "MemoryTreeVLA-phase2"
+wandb_project: "DualTreeVLA-phase2"
 
 # ── Data ──────────────────────────────────────────────────────────────────
 data:
@@ -34,6 +34,7 @@ data:
 # ── Model ─────────────────────────────────────────────────────────────────
 model:
   llm_path:    "checkpoints/Qwen2.5-1.5B-Instruct"  # upgrade to stronger LLM
+  clip_model_name: "checkpoints/CLIP/clip-vit-base-patch16"
   d:           256
   d_a:         7
   d_q:         84

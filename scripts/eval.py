@@ -1,5 +1,5 @@
-"""
-MemoryTreeVLA — Offline Evaluation Script
+﻿"""
+DualTreeVLA — Offline Evaluation Script
 ==========================================
 
 Benchmarks
@@ -86,7 +86,7 @@ import yaml
 # ================================================================
 
 def parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(description="MemoryTreeVLA offline evaluation")
+    p = argparse.ArgumentParser(description="DualTreeVLA offline evaluation")
 
     # Checkpoint & config
     p.add_argument("--ckpt",    required=True,  help="Path to .pt model checkpoint")
@@ -165,14 +165,14 @@ def load_config(path: str) -> dict:
 
 def load_model(ckpt_path: str, cfg: dict, device: torch.device):
     """
-    Load MemoryTreeVLA from checkpoint.
+    Load DualTreeVLA from checkpoint.
     Handles plain .pt (state_dict or full training ckpt) and
     DeepSpeed tag-file directory checkpoints.
     """
-    from memory_tree_vla.model import MemoryTreeVLA
+    from dual_tree_vla.model import DualTreeVLA
 
     m_cfg = cfg.get("model", {})
-    model = MemoryTreeVLA(
+    model = DualTreeVLA(
         llm_path   = m_cfg.get("llm_path", "checkpoints/Qwen2.5-1.5B-Instruct"),
         d          = m_cfg.get("d", 256),
         d_a        = m_cfg.get("d_a", 7),
@@ -813,7 +813,7 @@ def run_evaluation(args: argparse.Namespace):
     if args.dataset == "robocerebra":
         if args.data_root is None:
             raise ValueError("--data_root is required for dataset=robocerebra")
-        from memory_tree_vla.dataset import RoboCerebraDataset
+        from dual_tree_vla.dataset import RoboCerebraDataset
         ds = RoboCerebraDataset(
             root       = args.data_root,
             scenes     = args.scenes,
@@ -825,7 +825,7 @@ def run_evaluation(args: argparse.Namespace):
     else:   # libero
         if args.data_root is None:
             raise ValueError("--data_root is required for dataset=libero")
-        from memory_tree_vla.dataset.libero import LiberoDataset
+        from dual_tree_vla.dataset.libero import LiberoDataset
         ds = LiberoDataset(
             root       = args.data_root,
             img_h      = data_cfg.get("img_h", 224),
@@ -894,14 +894,14 @@ def _run_bench_evaluation(
       Observation_Mismatching— shifted observation description
       Random_Disturbance     — random object disturbances during execution
 
-    Since MemoryTreeVLA is evaluated offline (no simulation), we measure:
+    Since DualTreeVLA is evaluated offline (no simulation), we measure:
       action_l1 / action_l2          — action-prediction quality
       tree_nodes / tree_depth /
       tree_branches / tree_elevations — memory-tree structure
       subtask_boundary_f1 / subtask_sr
       prog_monotone_rate              — subtask-aware metrics
     """
-    from memory_tree_vla.dataset.robocerebra_bench import (
+    from dual_tree_vla.dataset.robocerebra_bench import (
         RoboCerebraBenchDataset,
         BENCH_TASK_TYPES,
     )

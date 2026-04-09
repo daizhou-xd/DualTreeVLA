@@ -1,8 +1,15 @@
-# MemoryTreeVLA
+﻿# DualTreeVLA
 
-层次记忆树视觉-语言-动作模型（Hierarchical Memory Tree Vision-Language-Action Model）
+> **「双树」**：Visual Tree（视觉树）+ Memory Tree（记忆树），两棵树并行驱动长时程机器人操作。
 
-**MemoryTreeVLA** 将在线构建的层次记忆树（HMT）与语义图最大生成树扫描（SGMTS）视觉编码器、Qwen2.5 大语言模型以及基于流匹配的动作预测头融合，用于长时序机器人操作任务。
+**DualTreeVLA** 同时维护两棵树结构，以最低推理延迟完成视觉编码与跨帧记忆读取：
+
+| 树 | 全称 | 延迟目标 | 职责 |
+|----|------|----------|------|
+| 🌿 **视觉树** | SGMTS（语义引导 Mamba 树扫描编码器） | **< 5 ms / 帧** | 每帧在 CLIP patch 特征上构建语义加权 MST，Tree-SSM O(P) 扫描 |
+| 🌳 **记忆树** | HMT（层级记忆树） | **< 1 ms / 帧** | 跨帧增量维护层级语义记忆，O(depth) 分支/合并 |
+
+两棵树的输出共同输入 Qwen2.5 LLM + Flow Matching 动作头，完成连续动作预测。
 
 ---
 
@@ -17,16 +24,14 @@
    - [Flash Attention 安装](#flash-attention-安装)
    - [DeepSpeed 安装](#deepspeed-安装)
 3. [数据准备](#数据准备)
-   - [mini-ImageNet](#mini-imagenet)
    - [RoboCerebra 训练集](#robocerebra-训练集)
    - [RoboCerebraBench](#robocerebrabench)
    - [LIBERO](#libero)
 4. [模型权重下载](#模型权重下载)
 5. [配置文件说明](#配置文件说明)
 6. [训练](#训练)
-   - [4 阶段训练流程总览](#4-阶段训练流程总览)
-   - [阶段 a — SGMTS Backbone 预训练（mini-ImageNet）](#阶段-a--sgmts-backbone-预训练mini-imagenet)
-   - [阶段 b — 全模型预训练（RoboCerebra）](#阶段-b--全模型预训练robocerebra)
+   - [3 阶段训练流程总览](#3-阶段训练流程总览)
+   - [全模型预训练（RoboCerebra）](#全模型预训练robocerebra)
    - [Phase 1 — FlowMatching 热身（LIBERO）](#phase-1--flowmatching-热身libero)
    - [Phase 2 — 全量微调（LIBERO）](#phase-2--全量微调libero)
    - [断点续训](#断点续训)
@@ -44,45 +49,44 @@
 ## 项目结构
 
 ```
-MemoryTreeVLA/
+DualTreeVLA/
 ├── configs/
 │   ├── default.yaml          # 评估 / 单阶段默认超参
-│   ├── pretrain.yaml         # 阶段 b RoboCerebra 预训练配置
+│   ├── pretrain.yaml         # 全模型预训练（RoboCerebra）配置
 │   ├── train_phase1.yaml     # Phase 1 LIBERO FlowMatching 热身
 │   ├── train_phase2.yaml     # Phase 2 LIBERO 全量微调
 │   ├── ds_zero2.json         # DeepSpeed ZeRO-2（Phase 1 推荐）
 │   └── ds_zero3.json         # DeepSpeed ZeRO-3 + CPU offload（Phase 2 推荐）
 ├── dataset/
-│   ├── mini-imagenet/        # SGMTS backbone 预训练数据
 │   ├── RoboCerebra/
 │   │   ├── RoboCerebra_trainset/   # 三场景训练集
 │   │   └── RoboCerebraBench/       # 六子集评测集
 │   └── LIBERO/               # LeRobot v2 parquet 格式数据集
 │       └── libero_10/
-├── memory_tree_vla/
+├── dual_tree_vla/
 │   ├── dataset/
 │   │   ├── libero.py             # LIBERO LeRobot 数据加载器
 │   │   ├── robocerebra.py        # RoboCerebra 训练集加载器
 │   │   └── robocerebra_bench.py  # RoboCerebraBench 六子集评测加载器
 │   ├── losses/
-│   │   └── tree_losses.py        # l_boundary / l_sem / l_elev / l_recon
+│   │   └── tree_losses.py        # l_boundary / l_sem / l_elev
 │   └── model/
 │       ├── attn.py               # FlashMHA（自动选择 Flash Attn 2 / SDPA）
-│       ├── fusion.py             # CrossModalFusion（三路门控融合）
-│       ├── memory_tree_vla.py    # MemoryTreeVLA 主模型
+│       ├── fusion.py             # CrossModalFusion（门控融合）
+│       ├── dual_tree_vla.py      # DualTreeVLA 主模型
 │       ├── semantic_jump_head.py # JumpAwareHead（Mamba 动作突变检测）
 │       ├── action_head/
-│       │   └── flow_matching.py  # FlowMatchingActionHead（DiT + ODE）
-│       ├── memory_tree/
+│       │   └── flow_matching.py  # FlowMatchingActionHead（ODE 推理）
+│       ├── memory_tree/          # 🌳 记忆树
 │       │   ├── node.py           # MemoryNode（leaf / abstract 双类型）
-│       │   ├── tree.py           # HierarchicalMemoryTree（insert / merge / branch）
+│       │   ├── tree.py           # HierarchicalMemoryTree（在线构建）
 │       │   ├── operations.py     # MLPElevation / semantic_elevation
-│       │   └── tree_ssm.py       # TreeSSMReadout（权重自适应 Mamba 树递推）
-│       └── sgmts/
-│           └── sgmts.py          # SGMTSEncoder（MST + 语义 Tree-SSM 扫描）
+│       │   └── tree_ssm.py       # TreeSSMReadout（< 1 ms，批量预计算优化）
+│       └── sgmts/                # 🌿 视觉树
+│           └── sgmts.py          # SGMTSEncoder（网格边缓存 + 层级并行 Tree-SSM，< 5 ms）
 ├── scripts/
-│   ├── pretrain.py           # 阶段 b 训练主入口
-│   ├── pretrain.sh           # 阶段 b 多卡启动脚本
+│   ├── pretrain.py           # 全模型预训练主入口
+│   ├── pretrain.sh           # 多卡启动脚本
 │   ├── train.py              # Phase 1 / 2 训练主入口
 │   ├── train_phase1.sh       # Phase 1 多卡启动脚本
 │   ├── train_phase2.sh       # Phase 2 多卡启动脚本（ZeRO-3）
@@ -91,7 +95,7 @@ MemoryTreeVLA/
 │   ├── Qwen2.5-0.5B/         # LLM 权重（已预置）
 │   └── Qwen2.5-1.5B-Instruct/
 ├── requirements.txt
-└── CONSTRUCTION.md           # 架构设计详细文档
+└── CONSTRUCTION.md           # 双树架构设计详细文档
 ```
 
 ---
@@ -114,7 +118,7 @@ MemoryTreeVLA/
 
 ### 系统依赖
 
-以 **Ubuntu 22.04 / 20.04** 为例（CentOS/Rocky 类似）：
+以 **Ubuntu 22.04 / 20.04** 为例：
 
 ```bash
 # 无 sudo 权限时，用 conda 安装等价依赖（推荐）
@@ -138,13 +142,11 @@ nvcc --version && nvidia-smi
 ### Python 环境
 
 ```bash
-# 推荐 conda 管理环境（Python 3.10）
-conda create -n memorytree python=3.10 -y
-conda activate memorytree
+conda create -n dualtree python=3.10 -y
+conda activate dualtree
 
-# 克隆项目
-git clone <YOUR_REPO_URL> MemoryTreeVLA
-cd MemoryTreeVLA
+git clone <YOUR_REPO_URL> DualTreeVLA
+cd DualTreeVLA
 ```
 
 ---
@@ -211,23 +213,7 @@ wandb login   # 令牌保存在 ~/.netrc，只需执行一次
 
 ## 数据准备
 
-### mini-ImageNet
-
-用于阶段 a 的 **SGMTS backbone 预训练**（图像分类监督），需提前下载。
-
-```
-dataset/mini-imagenet/
-└── data/
-    ├── train/
-    │   ├── n01532829/   # 每类约 600 张 JPEG
-    │   └── ...          # 共 64 类
-    ├── val/             # 16 类
-    └── test/            # 20 类
-```
-
-> 从 [Kaggle mini-ImageNet](https://www.kaggle.com/datasets/arjunashok33/miniimagenet) 或官方来源下载后解压到 `dataset/mini-imagenet/data/`。
-
----
+> 本项目**不需要 mini-ImageNet**。视觉树（SGMTS）使用冻结的 CLIP ViT 作为 patch 特征提取器，其视觉语义能力直接来自 CLIP 的预训练，无需额外的分类预训练阶段。
 
 ### RoboCerebra 训练集
 
@@ -238,8 +224,7 @@ dataset/RoboCerebra/RoboCerebra_trainset/
 │   │   ├── demo.hdf5              # 动作(T,7) + 状态(T,84)
 │   │   ├── case1.mp4              # RGB 视频
 │   │   └── task_description.json  # 子任务标注
-│   └── case2/
-│       └── ...
+│   └── case2/ ...
 ├── kitchen_table/
 └── study_table/
 ```
@@ -260,7 +245,7 @@ dataset/RoboCerebra/RoboCerebra_trainset/
 }
 ```
 
-重新下载：
+下载：
 
 ```bash
 pip install -U huggingface_hub
@@ -274,7 +259,7 @@ huggingface-cli download qiukingballball/RoboCerebra \
 
 ```bash
 python -c "
-from memory_tree_vla.dataset import RoboCerebraDataset
+from dual_tree_vla.dataset import RoboCerebraDataset
 ds = RoboCerebraDataset('dataset/RoboCerebra/RoboCerebra_trainset', subsample=4)
 print(f'Trajectories: {len(ds)}')
 s = ds[0]
@@ -297,12 +282,12 @@ dataset/RoboCerebra/RoboCerebraBench/
 ├── Observation_Mismatching/
 └── Random_Disturbance/
     └── case1/
-        ├── demo.hdf5              # 动作(T,7) + 状态(T,71)
+        ├── demo.hdf5
         ├── case1.mp4
         └── task_description.txt
 ```
 
-重新下载：
+下载：
 
 ```bash
 huggingface-cli download qiukingballball/RoboCerebra \
@@ -315,10 +300,9 @@ huggingface-cli download qiukingballball/RoboCerebra \
 
 ### LIBERO
 
-用于 Phase 1 / 2 训练（LeRobot v2 parquet 格式），已通过脚本下载至 `dataset/LIBERO/libero_10/`：
+用于 Phase 1 / 2 训练（LeRobot v2 parquet 格式）：
 
 ```bash
-# 重新下载（若目录缺失）
 python -c "
 from huggingface_hub import snapshot_download
 snapshot_download(
@@ -351,13 +335,15 @@ huggingface-cli download Qwen/Qwen2.5-1.5B-Instruct \
     --local-dir checkpoints/Qwen2.5-1.5B-Instruct
 ```
 
+> CLIP 视觉骨干（`openai/clip-vit-base-patch16`）在首次运行时由 `transformers` 自动下载到 HuggingFace 缓存，无需手动管理。如需离线使用，设置 `clip_model_name` 为本地路径。
+
 ---
 
 ## 配置文件说明
 
 | 配置文件 | 用途 | 主要可训练模块 |
 |---|---|---|
-| `configs/pretrain.yaml` | 阶段 b：RoboCerebra 预训练 | SGMTS, sem_proj, JumpAwareHead, TreeSSM, MLPElevation |
+| `configs/pretrain.yaml` | 全模型预训练（RoboCerebra） | SGMTS adapter, sem_proj, JumpAwareHead, TreeSSM, MLPElevation |
 | `configs/train_phase1.yaml` | Phase 1：LIBERO FlowMatching 热身 | CrossModalFusion, FlowMatchingActionHead |
 | `configs/train_phase2.yaml` | Phase 2：LIBERO 全量微调 | 全部模块 |
 | `configs/default.yaml` | 评估 / 单阶段默认 | — |
@@ -366,74 +352,51 @@ huggingface-cli download Qwen/Qwen2.5-1.5B-Instruct \
 
 ```yaml
 model:
-  llm_path:    "checkpoints/Qwen2.5-0.5B"
-  sgmts_ckpt:  null        # 阶段 a 训练后的 SGMTS 权重路径
-  d:           256         # 统一嵌入维度
-  H_a:         16          # 动作预测步长
-  theta_fuse:  0.35        # 记忆树合并阈值（预训练后 0.35，未对齐时 0.65）
-  K_elev:      4           # 触发语义提升的子节点数阈值
+  llm_path:        "checkpoints/Qwen2.5-0.5B"
+  clip_model_name: null   # CLIP 视觉骨干 HuggingFace ID（null = PatchCNN fallback）
+                          # 推荐填入 "openai/clip-vit-base-patch16"
+  d:               256    # 统一嵌入维度
+  H_a:             16     # 动作预测步长
+  theta_fuse:      0.35   # 记忆树合并阈值（预训练后 0.35，未对齐时 0.65）
+  mount_tau:       0.4    # 挂载点搜索阈值（余弦距离）
+  max_tree_depth:  4      # 记忆树最大深度（超出则剪枝旧记忆）
 ```
+
+> **关于 CLIP**：`clip_model_name` 留空时退回轻量 `PatchCNN`（适合无网络调试）。生产训练推荐填入 CLIP 模型 ID，视觉树可利用预训练语义特征，**无需任何分类预训练**。
 
 ---
 
 ## 训练
 
-### 4 阶段训练流程总览
+### 3 阶段训练流程总览
 
 ```
-[a] SGMTS Backbone 预训练  ──→  [b] 全模型预训练  ──→  Phase 1  ──→  Phase 2
-    mini-ImageNet (L_cls)        RoboCerebra             LIBERO         LIBERO
-                                 (L_boundary+L_sem+L_elev) (L_flow)      (L_flow)
+全模型预训练（RoboCerebra）  ──→  Phase 1（LIBERO）  ──→  Phase 2（LIBERO）
+  L_boundary + L_sem + L_elev        L_flow only              L_flow only
+  SGMTS adapter + JumpAwareHead      CrossModalFusion          全部模块
+  TreeSSM + MLPElevation             FlowMatchingHead          LLM: 0.1× LR
 ```
 
 | 阶段 | 数据集 | 可训练模块 | 损失函数 | 脚本 |
 |---|---|---|---|---|
-| **[a] SGMTS 预训练** | mini-ImageNet | SGMTSEncoder (backbone only) | $L_\text{cls}$ (分类交叉熵) | `pretrain.py --stage sgmts` |
-| **[b] 全模型预训练** | RoboCerebra | SGMTS, sem_proj, JumpAwareHead, TreeSSM, MLPElevation | $L_\text{boundary}+L_\text{sem}+L_\text{elev}$ | `pretrain.sh` |
+| **全模型预训练** | RoboCerebra | SGMTS adapter, JumpAwareHead, TreeSSM, MLPElevation | $L_\text{boundary}+L_\text{sem}+L_\text{elev}$ | `pretrain.sh` |
 | **Phase 1** | LIBERO | CrossModalFusion, FlowMatchingActionHead | $L_\text{flow}$ | `train_phase1.sh` |
 | **Phase 2** | LIBERO | 全部模块 | $L_\text{flow}$ | `train_phase2.sh` |
 
-> **冻结说明**：LLM backbone 在 [b] / Phase 1 阶段始终冻结。Phase 2 中以 0.1× 学习率微调 LLM。
+**冻结说明**：
+- CLIP ViT 在整个训练流程中**始终冻结**，只有轻量 Adapter（Linear + LayerNorm）参与训练
+- LLM backbone 在预训练 / Phase 1 阶段冻结；Phase 2 以 0.1× 学习率微调
 
 ---
 
-### 阶段 a — SGMTS Backbone 预训练（mini-ImageNet）
+### 全模型预训练（RoboCerebra）
 
-单独训练 SGMTS 视觉编码器的 Backbone，在 mini-ImageNet 上做图像分类，获得有效的语义补丁特征：
-
-```bash
-conda activate memorytree
-cd /path/to/MemoryTreeVLA
-
-# 单卡调试
-python scripts/pretrain.py --config configs/default.yaml --stage sgmts
-
-# 多卡（推荐）
-accelerate launch \
-    --num_processes 8 \
-    --mixed_precision bf16 \
-    scripts/pretrain.py \
-        --config configs/default.yaml \
-        --stage sgmts \
-        --data_root dataset/mini-imagenet/data \
-        --epochs 100 \
-        --ckpt_dir checkpoints/runs/sgmts
-```
-
-训练完成后将权重路径填入 `configs/default.yaml` 的 `model.sgmts_ckpt`：
-
-```yaml
-model:
-  sgmts_ckpt: "checkpoints/runs/sgmts/sgmts_best.pt"
-```
-
----
-
-### 阶段 b — 全模型预训练（RoboCerebra）
-
-基于阶段 a 的 SGMTS，训练 JumpAwareHead、TreeSSM、MLPElevation 等语义结构学习模块：
+目标：让视觉树学会语义引导的 patch 扫描，让记忆树学会子任务边界检测与语义提升。
 
 ```bash
+conda activate dualtree
+cd /path/to/DualTreeVLA
+
 # 单卡调试
 python scripts/pretrain.py --config configs/pretrain.yaml
 
@@ -450,10 +413,10 @@ Checkpoint 保存至 `checkpoints/runs/pretrain/`，最优模型为 `pretrain_be
 
 ### Phase 1 — FlowMatching 热身（LIBERO）
 
-冻结语义模块，仅训练 CrossModalFusion 和 FlowMatchingActionHead：
+冻结双树与 LLM，仅训练 CrossModalFusion 和 FlowMatchingActionHead：
 
 ```bash
-# 单卡调试（需先完成阶段 b）
+# 单卡调试（需先完成预训练）
 python scripts/train.py --config configs/train_phase1.yaml --phase 1
 
 # 多卡
@@ -463,7 +426,7 @@ bash scripts/train_phase1.sh
 bash scripts/train_phase1.sh 4
 ```
 
-配置文件 `configs/train_phase1.yaml` 中 `model.pretrain_ckpt` 指向阶段 b 的输出：
+配置文件 `configs/train_phase1.yaml` 中 `model.pretrain_ckpt` 指向预训练输出：
 
 ```yaml
 model:
@@ -491,13 +454,12 @@ bash scripts/train_phase2.sh 4
 ### 断点续训
 
 ```bash
-# 阶段 b 断点续训（指定 .pt 文件）
+# 预训练断点续训
 python scripts/pretrain.py \
     --config configs/pretrain.yaml \
     --resume checkpoints/runs/pretrain/pretrain_ep015.pt
 
-# Phase 1 断点续训（修改 yaml 中的 resume_from 字段即可）
-# 或命令行指定（train.py 支持 --resume）
+# Phase 1 断点续训
 python scripts/train.py \
     --config configs/train_phase1.yaml \
     --phase 1 \
@@ -508,9 +470,6 @@ Checkpoint 结构：
 
 ```
 checkpoints/runs/
-├── sgmts/
-│   ├── sgmts_ep050.pt
-│   └── sgmts_best.pt
 ├── pretrain/
 │   ├── pretrain_ep010.pt
 │   └── pretrain_best.pt
@@ -527,7 +486,7 @@ checkpoints/runs/
 ### Weights & Biases 可视化
 
 ```bash
-# 训练时写入本地（国内网络推荐 offline 模式）
+# 国内网络推荐 offline 模式
 WANDB_MODE=offline python scripts/pretrain.py \
     --config configs/pretrain.yaml
 
@@ -535,7 +494,7 @@ WANDB_MODE=offline python scripts/pretrain.py \
 wandb sync wandb/offline-run-*
 ```
 
-各阶段 wandb 项目名在对应 yaml 中通过 `wandb_project` 字段配置。
+各阶段 wandb 项目名通过对应 yaml 中的 `wandb_project` 字段配置。
 
 ---
 
@@ -562,8 +521,8 @@ wandb sync wandb/offline-run-*
 ### RoboCerebraBench 评估
 
 ```bash
-conda activate memorytree
-cd /path/to/MemoryTreeVLA
+conda activate dualtree
+cd /path/to/DualTreeVLA
 
 # 评估全部 6 种任务类型（推荐）
 python scripts/eval.py \
@@ -724,18 +683,25 @@ model:
   llm_path: "checkpoints/Qwen2.5-0.5B"
 ```
 
-### 5. 数据加载慢
+### 5. CLIP 权重下载失败（国内网络）
+
+```bash
+# 方式一：设置 HuggingFace 镜像
+export HF_ENDPOINT=https://hf-mirror.com
+# 方式二：手动下载后指定本地路径
+model:
+  clip_model_name: "/path/to/local/clip-vit-base-patch16"
+```
+
+### 6. 数据加载慢
 
 ```bash
 # 增加 DataLoader workers（yaml 的 train.num_workers: 8）
 ```
-
-### 6. mini-ImageNet 找不到类目录
-
-阶段 a 预训练期望目录结构为 `dataset/mini-imagenet/data/train/<class>/`。若下载来源不同，可通过 `--data_root` 指定实际路径。
 
 ---
 
 ## 引用
 
 如果本项目对您的研究有帮助，请考虑引用相关工作。
+

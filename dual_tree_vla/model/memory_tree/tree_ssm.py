@@ -148,24 +148,23 @@ class TreeSSMReadout(nn.Module):
         B = self.B_proj(X_p)                             # (N, d_state)
         C = self.C_proj(X_p)                             # (N, d_state)
 
-        # ── BFS 顺序树递推 ───────────────────────────────────────────
-        N         = len(bfs_ids)
-        node2idx  = {nid: i for i, nid in enumerate(bfs_ids)}
+        # ── BFS 顺序树递推（预先批量计算 A_bar/Bx，减少逐节点 GPU kernel 启动）──
+        N        = len(bfs_ids)
+        node2idx = {nid: i for i, nid in enumerate(bfs_ids)}
+
+        # 批量预计算：A_bar[i] = exp(Δ[i]·A)，Bx[i] = (Δ[i]⊙x[i])[:,None]·B[i][None,:]
+        A_bar_all = torch.exp(delta.unsqueeze(2) * A)                      # (N, d_ssm, d_state)
+        Bx_all    = (delta * X_p).unsqueeze(2) * B.unsqueeze(1)            # (N, d_ssm, d_state)
+
         H = X_p.new_zeros(N, self.d_ssm, self.d_state)
-        Y = X_p.new_zeros(N, self.d_ssm)
-
         for i, nid in enumerate(bfs_ids):
-            d_i   = delta[i]                                       # (d_ssm,)
-            A_bar = torch.exp(d_i.unsqueeze(1) * A)               # (d_ssm, d_state)
-            B_bar = d_i.unsqueeze(1) * B[i].unsqueeze(0)          # (d_ssm, d_state)
-
             par_id = tree.nodes[nid].parent_id
             h_par  = (H[node2idx[par_id]]
                       if par_id is not None and par_id in node2idx
                       else H.new_zeros(self.d_ssm, self.d_state))
+            H[i]   = A_bar_all[i] * h_par + Bx_all[i]
 
-            h_i    = A_bar * h_par + B_bar * X_p[i].unsqueeze(1)  # (d_ssm, d_state)
-            H[i]   = h_i
-            Y[i]   = (h_i * C[i].unsqueeze(0)).sum(dim=1) + self.D * X_p[i]
+        # 批量 Y 计算（脱离循环，单次 GPU kernel）
+        Y = (H * C.unsqueeze(1)).sum(dim=2) + self.D * X_p                # (N, d_ssm)
 
         return self.out_norm(Y)   # (N, d_ssm)

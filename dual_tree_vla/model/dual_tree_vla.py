@@ -1,12 +1,12 @@
-"""
-MemoryTreeVLA — 主模型 (CONSTRUCTION.md §2.1)
+﻿"""
+DualTreeVLA — 主模型 (CONSTRUCTION.md §2.1)
 
 数据流 (单帧):
   task_desc → LLM → g_task (SGMTS) + task_tokens
   HMT top-2 abstract nodes → s_top → SGMTS (β-blended)
   SGMTS(image, g_sem) → Z_v (B, P, d_visual)
-  TreeSSM(HMT) → Z_M (B, N_M, d_ssm)
-  CrossModalFusion(Z_M, Z_v, g_lang, q) → Z_fused
+    TreeSSM(HMT) → m_ctx_last (B, d_ssm)
+    CrossModalFusion(z_v_mean, m_ctx_last, g_lang, q) → Z_fused
   FlowMatchingHead(Z_fused) → â
   JumpAwareHead(A_act_hist, â_1) → p_jump → HMT.insert(z_v_mean, â_1, p_jump>=0.5)
 
@@ -38,7 +38,7 @@ from .action_head import FlowMatchingActionHead
 from .semantic_jump_head import JumpAwareHead
 
 
-class MemoryTreeVLA(nn.Module):
+class DualTreeVLA(nn.Module):
     """
     Parameters
     ----------
@@ -74,6 +74,7 @@ class MemoryTreeVLA(nn.Module):
         mount_tau: float = 0.4,
         max_tree_depth: int = 4,
         freeze_llm: bool = True,
+        clip_model_name: Optional[str] = None,
         # legacy / compat params (unused)
         theta_fuse: float = 0.4,
         tau: float = 0.1,
@@ -121,6 +122,7 @@ class MemoryTreeVLA(nn.Module):
             d_visual=d_visual,
             patch_size=patch_size,
             d_state=d_state,
+            clip_model_name=clip_model_name,  # None → PatchCNN；非 None → 冻结 CLIP ViT
         )
 
         # ── JumpAwareHead ─────────────────────────────────────────────
@@ -260,6 +262,17 @@ class MemoryTreeVLA(nn.Module):
             losses.append(self.action_head.flow_loss(a_gt, Z_t))
         return torch.stack(losses).mean()
 
+    def _encode_text_descs(self, descs: List[str], device: torch.device) -> torch.Tensor:
+        """Encode a list of subtask descriptions to mean-pooled language embeddings (S, d_lang)."""
+        enc = self.tokenizer(
+            descs, return_tensors="pt", padding=True, truncation=True, max_length=64,
+        ).to(device)
+        llm_grad = any(p.requires_grad for p in self.llm.parameters())
+        with torch.set_grad_enabled(llm_grad):
+            out = self.llm(**enc)
+        mask = enc["attention_mask"].unsqueeze(-1).float()
+        return (out.last_hidden_state * mask).sum(1) / mask.sum(1).clamp(min=1)
+
     def _compute_boundary_labels(
         self,
         actions: torch.Tensor,   # (B, T, d_a)
@@ -300,8 +313,9 @@ class MemoryTreeVLA(nn.Module):
         Z_v     = self.sgmts(image, g_lang, [s_top], [beta_v])   # (1, P, d_visual)
         z_v_mean = Z_v.mean(1).squeeze(0)                         # (d_visual,)
 
-        # 4. TreeSSM readout
-        Z_M = self.tree_ssm(tree, device=device).unsqueeze(0)     # (1, N_M, d_ssm)
+        # 4. TreeSSM readout（取最后一个语义token作为 m_ctx）
+        Z_M = self.tree_ssm(tree, device=device)                   # (N_M, d_ssm)
+        m_ctx = Z_M[-1].unsqueeze(0)                               # (1, d_ssm)
         pad_q = q
         if pad_q.shape[1] < self.d_q:
             pad_q = F.pad(pad_q, (0, self.d_q - pad_q.shape[1]))
@@ -309,7 +323,7 @@ class MemoryTreeVLA(nn.Module):
             pad_q = pad_q[:, :self.d_q]
 
         # 5. Fusion
-        Z_fused = self.fusion(Z_M, Z_v, g_lang, pad_q)           # (1, N_ctx, d)
+        Z_fused = self.fusion(z_v_mean.unsqueeze(0), m_ctx, g_lang, pad_q)  # (1, 1, d)
 
         # 6. Flow matching prediction
         a_pred  = self.action_head.sample(Z_fused, device=device)  # (1, H_a, d_a)
@@ -346,10 +360,15 @@ class MemoryTreeVLA(nn.Module):
         states: torch.Tensor,           # (B, T, d_q)
         actions: torch.Tensor,          # (B, T, d_a)
         subtask_ids: Optional[torch.Tensor] = None,
+        subtask_descs: Optional[List[List[str]]] = None,
         mode: str = "phase1",
+        w_boundary: float = 1.0,
+        w_sem: float = 0.5,
+        w_elev: float = 0.2,
+        tau_sem: float = 0.07,
     ) -> Dict[str, torch.Tensor]:
         """
-        mode='pretrain' : L_boundary only (+ external L_sem/L_elev from pretrain.py)
+        mode='pretrain' : L_boundary + L_sem + L_elev
         mode='phase1'   : L_flow only
         mode='phase2'   : L_flow only
         """
@@ -399,7 +418,7 @@ class MemoryTreeVLA(nn.Module):
             z_v_mean_t = Z_v_t.mean(1)   # (B, d_visual)
 
             # Per-sample: JumpAwareHead + tree update
-            Z_M_list = []
+            m_ctx_list = []
             for b in range(B):
                 tree_b      = self.get_tree(b)
                 active_node = tree_b.nodes.get(tree_b.active_id)
@@ -426,16 +445,10 @@ class MemoryTreeVLA(nn.Module):
                     tree_b.elevation_pending_parent = None
 
                 Z_M_b = self.tree_ssm(tree_b, device=device)   # (N_M, d_ssm)
-                Z_M_list.append(Z_M_b)
+                m_ctx_list.append(Z_M_b[-1])                   # (d_ssm,)
 
-            # Pad Z_M to uniform length
-            N_max = max(z.shape[0] for z in Z_M_list)
-            Z_M = torch.stack([
-                F.pad(z, (0, 0, 0, N_max - z.shape[0])) if z.shape[0] < N_max else z
-                for z in Z_M_list
-            ])   # (B, N_max, d_ssm)
-
-            Z_fused_t = self.fusion(Z_M, Z_v_t, g_lang, q_t)   # (B, N_ctx, d)
+            m_ctx_t = torch.stack(m_ctx_list, dim=0)           # (B, d_ssm)
+            Z_fused_t = self.fusion(z_v_mean_t, m_ctx_t, g_lang, q_t)   # (B, 1, d)
             if not compute_flow:
                 Z_fused_t = Z_fused_t.detach()
             all_Z_fused.append(Z_fused_t)
@@ -447,12 +460,90 @@ class MemoryTreeVLA(nn.Module):
             L_flow = self._compute_flow_loss(all_Z_fused, actions, device)
             return {"L_flow": L_flow, "total": L_flow}
 
-        # ── Pretrain: boundary loss via JumpAwareHead ─────────────────
+        # ── Pretrain: boundary + semantic + elevation losses ─────────
         if compute_jump and jump_logits:
-            from memory_tree_vla.losses.tree_losses import l_boundary
+            from dual_tree_vla.losses.tree_losses import l_boundary, l_sem, l_elev
+
             logits_t = torch.cat(jump_logits, dim=0)          # (B*T,)
             y_act    = self._compute_boundary_labels(actions, device)
             L_bnd    = l_boundary(logits_t, y_act)
-            return {"L_boundary": L_bnd, "total": L_bnd}
+
+            # L_sem: abstract node semantics vs subtask text embeddings
+            L_sem = torch.zeros((), device=device)
+            if subtask_ids is not None:
+                s_nodes_list, s_text_list = [], []
+                sem_dtype = next(self.sem_proj.parameters()).dtype
+                for b in range(B):
+                    tree_b = self.get_tree(b)
+                    if tree_b.size() == 0:
+                        continue
+                    descs = ([instructions[b]]
+                             if subtask_descs is None or b >= len(subtask_descs) or not subtask_descs[b]
+                             else subtask_descs[b])
+                    g_sub = self._encode_text_descs(descs, device).to(dtype=sem_dtype)  # (S, d_lang)
+                    for nid, node in tree_b.nodes.items():
+                        if node.is_leaf() or node.s is None:
+                            continue
+                        t_idx = min(nid, subtask_ids.shape[1] - 1)
+                        sid = int(subtask_ids[b, t_idx].item())
+                        sid = max(0, min(sid, g_sub.shape[0] - 1))
+                        s_proj_out = self.sem_proj(node.s.to(device=device, dtype=sem_dtype))
+                        s_nodes_list.append(s_proj_out)
+                        s_text_list.append(g_sub[sid])
+                if len(s_nodes_list) >= 2:
+                    S_nodes = torch.stack(s_nodes_list, dim=0)
+                    S_text  = torch.stack(s_text_list, dim=0)
+                    L_sem = l_sem(S_nodes, S_text, temperature=tau_sem)
+
+            # L_elev: abstract node vs weighted children semantics
+            L_elev = torch.zeros((), device=device)
+            elev_items = []
+            elev_dtype = next(self.mlp_elev.parameters()).dtype
+            for b in range(B):
+                tree_b = self.get_tree(b)
+                for _, node in tree_b.nodes.items():
+                    if node.is_leaf() or node.s is None:
+                        continue
+                    ch_ids = node.children_ids
+                    if len(ch_ids) < 1:
+                        continue
+                    s_ch_list = []
+                    w_ch_list = []
+                    for cid in ch_ids:
+                        child = tree_b.nodes[cid]
+                        w_ch_list.append(child.w)
+                        if child.is_leaf():
+                            z_v_c = child.z_v.to(device=device, dtype=elev_dtype)
+                            with torch.no_grad():
+                                s_proxy = self.mlp_elev(z_v_c.unsqueeze(0)).squeeze(0)
+                            s_ch_list.append(s_proxy)
+                        elif child.s is not None:
+                            s_ch_list.append(child.s.to(device=device, dtype=elev_dtype))
+                    if len(s_ch_list) < 1:
+                        continue
+
+                    leaf_zv = [tree_b.nodes[c].z_v.to(device=device, dtype=elev_dtype)
+                               for c in ch_ids if tree_b.nodes[c].is_leaf()]
+                    if leaf_zv:
+                        lw = [tree_b.nodes[c].w for c in ch_ids if tree_b.nodes[c].is_leaf()]
+                        lw_t = torch.tensor(lw, device=device, dtype=elev_dtype)
+                        lw_t = lw_t / lw_t.sum().clamp(min=1e-6)
+                        z_pool = sum(z * w for z, w in zip(leaf_zv, lw_t))
+                        s_abs = self.mlp_elev(z_pool.unsqueeze(0)).squeeze(0)
+                    else:
+                        s_abs = node.s.to(device=device, dtype=elev_dtype)
+
+                    elev_items.append(l_elev(s_abs, s_ch_list, w_ch_list))
+
+            if elev_items:
+                L_elev = torch.stack(elev_items).mean()
+
+            total = w_boundary * L_bnd + w_sem * L_sem + w_elev * L_elev
+            return {
+                "L_boundary": L_bnd,
+                "L_sem": L_sem,
+                "L_elev": L_elev,
+                "total": total,
+            }
 
         return {"total": torch.zeros((), device=device)}

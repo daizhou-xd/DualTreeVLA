@@ -1,4 +1,4 @@
-# MemoryTreeVLA Phase 1 Training — FlowMatching Warm-up
+﻿# DualTreeVLA Phase 1 Training — FlowMatching Warm-up
 # ─────────────────────────────────────────────────────────────────────────
 # Stage: Phase 1 (FlowMatching warm-up, frozen LLM + pre-trained modules)
 # Dataset: LIBERO (LeRobot parquet format)
@@ -17,7 +17,7 @@ mixed_precision: "bf16"
 grad_accum: 2
 seed: 42
 
-wandb_project: "MemoryTreeVLA-phase1"
+wandb_project: "DualTreeVLA-phase1"
 
 # ── Data ──────────────────────────────────────────────────────────────────
 data:
@@ -40,6 +40,7 @@ data:
 # ── Model ─────────────────────────────────────────────────────────────────
 model:
   llm_path:    "checkpoints/Qwen2.5-0.5B"
+  clip_model_name: "checkpoints/CLIP/clip-vit-base-patch16"
   pretrain_ckpt: "checkpoints/runs/pretrain/pretrain_best.pt"
   d:           256
   d_a:         7

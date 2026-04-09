@@ -1,4 +1,4 @@
-# MemoryTreeVLA — Default configuration
+﻿# DualTreeVLA — Default configuration
 # ─────────────────────────────────────────────────────────────────
 # Single GPU:  python train.py --config configs/default.yaml --phase 1
 # 8-GPU DS:    bash scripts/train_8gpu.sh 1
@@ -21,8 +21,8 @@ data:
 # ── Model ─────────────────────────────────────────────────────────
 model:
   llm_path:    "checkpoints/Qwen2.5-0.5B"
-  # SGMTS backbone 预训练权重（先用 --stage sgmts 在 mini-ImageNet 训好后填入）
-  sgmts_ckpt:  null       # e.g. "checkpoints/runs/sgmts/sgmts_best.pt"
+  # CLIP视觉骨干（推荐）：填入 HuggingFace 模型 ID，留空则使用 PatchCNN fallback
+  clip_model_name: "checkpoints/CLIP/clip-vit-base-patch16"
   d:           256       # unified embedding dim
   d_a:         7         # action dim (Franka: 6D Δ-pose + gripper)
   d_q:         84        # proprioceptive state dim
@@ -63,7 +63,7 @@ log_every:   10          # print every N batches
 # ── Weights & Biases ────────────────────────────────────────────
 # Enable at runtime: --wandb  (no need to change this file)
 wandb:
-  project: "MemoryTreeVLA"
+  project: "DualTreeVLA"
   entity:  null            # set to your W&B team name
   # name and tags are auto-generated from phase + timestamp; override with
   # --wandb_name <run-name>  --wandb_tags phase1 a6000  on the command line

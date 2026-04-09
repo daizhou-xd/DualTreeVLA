@@ -1,5 +1,5 @@
-"""
-MemoryTreeVLA 训练脚本 — Phase 1 / Phase 2（参考 Evo-1 train.py 风格）
+﻿"""
+DualTreeVLA 训练脚本 — Phase 1 / Phase 2（参考 Evo-1 train.py 风格）
 
 ═══════════════════════════════════════════════════════════════════
   Phase 1 — FlowMatching 热身（LIBERO，LLM 冻结）
@@ -56,8 +56,8 @@ except ImportError:
 import sys
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from memory_tree_vla.model import MemoryTreeVLA
-from memory_tree_vla.dataset import LiberoDataset, libero_collate
+from dual_tree_vla.model import DualTreeVLA
+from dual_tree_vla.dataset import LiberoDataset, libero_collate
 
 
 # ================================================================
@@ -93,7 +93,7 @@ def get_lr_lambda(warmup_steps: int, total_steps: int, resume_step: int = 0):
     return lr_lambda
 
 
-def inspect_named_modules(model: MemoryTreeVLA, accel=None):
+def inspect_named_modules(model: DualTreeVLA, accel=None):
     """打印各模块参数统计（直接对标 Evo-1 inspect_named_submodules）。"""
     groups = {
         "LLM backbone":     model.llm,
@@ -121,7 +121,7 @@ def inspect_named_modules(model: MemoryTreeVLA, accel=None):
 #  冻结策略
 # ================================================================
 
-def freeze_phase1(model: MemoryTreeVLA):
+def freeze_phase1(model: DualTreeVLA):
     """
     Phase 1：冻结 LLM + 全部预训练模块，只训 CrossModalFusion + FlowMatchingHead。
     """
@@ -137,7 +137,7 @@ def freeze_phase1(model: MemoryTreeVLA):
     return n_train, n_total
 
 
-def unfreeze_phase2(model: MemoryTreeVLA):
+def unfreeze_phase2(model: DualTreeVLA):
     """
     Phase 2：全量解冻（LLM 也解冻，但 LR 极低）。
     """
@@ -213,7 +213,7 @@ def train(cfg: dict, phase: int):
 
     # ── 构建模型 ────────────────────────────────────────────────────
     mc = cfg["model"]
-    model = MemoryTreeVLA(
+    model = DualTreeVLA(
         llm_path   = mc["llm_path"],
         d          = mc.get("d", 256),
         d_a        = mc.get("d_a", 7),
@@ -299,7 +299,7 @@ def train(cfg: dict, phase: int):
     model.train()
 
     # ── W&B ──────────────────────────────────────────────────────────
-    project_name = cfg.get("wandb_project", f"MemoryTreeVLA-phase{phase}")
+    project_name = cfg.get("wandb_project", f"DualTreeVLA-phase{phase}")
     if _WANDB and is_main(accel):
         wandb.init(
             project=project_name,

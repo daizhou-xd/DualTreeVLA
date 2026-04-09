@@ -14,6 +14,30 @@ from .tree import HierarchicalMemoryTree
 #  Operation ① — Memory Reinforcement                                      #
 # ======================================================================= #
 
+def merge(
+    tree: HierarchicalMemoryTree,
+    z_v: torch.Tensor,
+    a: torch.Tensor,
+):
+    """Merge operation wrapper: Welford update on active leaf (delegates to tree)."""
+    if tree.active_id is None:
+        tree.insert(z_v=z_v, a=a, force_branch=False, s_current=None)
+        return
+    tree._merge_update(tree.nodes[tree.active_id], z_v, a)
+
+
+def branch(
+    tree: HierarchicalMemoryTree,
+    z_v: torch.Tensor,
+    a: torch.Tensor,
+    s_current: Optional[torch.Tensor] = None,
+):
+    """Branch operation wrapper: semantic-aware split (delegates to tree)."""
+    if tree.root_id is None:
+        tree.insert(z_v=z_v, a=a, force_branch=True, s_current=s_current)
+        return
+    tree._branch_split(z_v=z_v, a=a, s_current=s_current)
+
 def reinforce(
     tree: HierarchicalMemoryTree,
     grad_norms: Dict[int, float],

@@ -1,4 +1,4 @@
-# MemoryTreeVLA dependencies
+﻿# DualTreeVLA dependencies
 # Install order matters: torch first, then flash-attn
 
 # ── Core ──────────────────────────────────────────────────────────

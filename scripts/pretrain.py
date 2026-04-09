@@ -1,5 +1,5 @@
-"""
-MemoryTreeVLA 预训练脚本 — 语义边界结构学习
+﻿"""
+DualTreeVLA 预训练脚本 — 语义边界结构学习
 
 预训练阶段目标（RoboCerebra）:
   1. 训练 JumpAwareHead：纯动作突变 → 分支点检测（L_boundary）
@@ -51,10 +51,8 @@ except ImportError:
 import sys
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from memory_tree_vla.model import MemoryTreeVLA
-from memory_tree_vla.model.memory_tree.operations import semantic_elevation
-from memory_tree_vla.losses import l_sem, l_elev, pretrain_loss
-from memory_tree_vla.dataset import RoboCerebraDataset, robocerebra_collate
+from dual_tree_vla.model import DualTreeVLA
+from dual_tree_vla.dataset import RoboCerebraDataset, robocerebra_collate
 
 
 # ================================================================
@@ -83,7 +81,7 @@ def log_msg(msg: str, accel=None):
 #  冻结策略 — 预训练阶段
 # ================================================================
 
-def freeze_for_pretrain(model: MemoryTreeVLA):
+def freeze_for_pretrain(model: DualTreeVLA):
     """
     冻结: LLM backbone, CrossModalFusion, FlowMatchingActionHead
     可训练: SGMTS, s_proj, JumpAwareHead, TreeSSMReadout, MLPElevation
@@ -114,7 +112,7 @@ def freeze_for_pretrain(model: MemoryTreeVLA):
     return n_train, n_total
 
 
-def inspect_parameters(model: MemoryTreeVLA, accel=None):
+def inspect_parameters(model: DualTreeVLA, accel=None):
     log_msg("\n── 参数统计 ──────────────────────────────", accel)
     groups = {
         "LLM backbone":         model.llm,
@@ -144,7 +142,7 @@ def inspect_parameters(model: MemoryTreeVLA, accel=None):
 # ================================================================
 
 def pretrain_step(
-    model: MemoryTreeVLA,
+    model: DualTreeVLA,
     batch: Dict,
     device: torch.device,
     loss_cfg: dict,
@@ -161,149 +159,27 @@ def pretrain_step(
         subtask_ids = subtask_ids.to(device)
     instructions: List[str] = batch["instructions"]
 
-    # 预训练 forward：仅 JumpAwareHead + L_boundary
+    # 预训练 forward：L_boundary + L_sem + L_elev（模型内部完成）
     losses = model(
         images=frames,
         instructions=instructions,
         states=states,
         actions=actions,
         subtask_ids=subtask_ids,
+        subtask_descs=batch.get("subtask_descs"),
         mode="pretrain",
+        w_boundary=loss_cfg.get("w_boundary", 1.0),
+        w_sem=loss_cfg.get("w_sem", 0.5),
+        w_elev=loss_cfg.get("w_elev", 0.2),
+        tau_sem=loss_cfg.get("tau_sem", 0.07),
     )
 
-    # L_sem：从树中提取分支节点语义，与子任务文本对比
-    w_sem = loss_cfg.get("w_sem", 0.5)
-    L_sem_val = torch.zeros((), device=device)
-    if w_sem > 0 and subtask_ids is not None:
-        L_sem_val = _compute_tree_sem_loss(model, batch, device, loss_cfg)
-
-    # L_elev：语义提升一致性
-    w_elev = loss_cfg.get("w_elev", 0.2)
-    L_elev_val = torch.zeros((), device=device)
-    if w_elev > 0:
-        L_elev_val = _compute_tree_elev_loss(model, frames.shape[0], device, model.mlp_elev)
-
-    # 合并总损失（L_boundary 已在 losses["total"] 中）
-    L_boundary = losses.get("L_boundary", torch.zeros((), device=device))
-    w_boundary = loss_cfg.get("w_boundary", 1.0)
-    total = w_boundary * L_boundary + w_sem * L_sem_val + w_elev * L_elev_val
-
     return {
-        "loss":       total,
-        "L_boundary": L_boundary.detach(),
-        "L_sem":      L_sem_val.detach(),
-        "L_elev":     L_elev_val.detach(),
+        "loss":       losses.get("total", torch.zeros((), device=device)),
+        "L_boundary": losses.get("L_boundary", torch.zeros((), device=device)).detach(),
+        "L_sem":      losses.get("L_sem", torch.zeros((), device=device)).detach(),
+        "L_elev":     losses.get("L_elev", torch.zeros((), device=device)).detach(),
     }
-
-
-@torch.no_grad()
-def _encode_subtask_text(model: MemoryTreeVLA, descs: List[str], device) -> torch.Tensor:
-    """用 LLM 编码子任务描述，返回均值池化语义向量 (N, d_lang)。"""
-    enc = model.tokenizer(
-        descs, return_tensors="pt", padding=True, truncation=True, max_length=64
-    ).to(device)
-    out  = model.llm(**enc)
-    mask = enc["attention_mask"].unsqueeze(-1).float()
-    return (out.last_hidden_state * mask).sum(1) / mask.sum(1).clamp(min=1)
-
-
-def _compute_tree_sem_loss(model: MemoryTreeVLA, batch: Dict, device, loss_cfg: dict) -> torch.Tensor:
-    """
-    L_sem：遍历树中抽象节点（已提升的节点），做子任务语义 InfoNCE。
-
-    abstract node.s (d,) 经 sem_proj → d_lang，与子任务描述的语言嵌入对齐。
-    跳过所有叶节点（s=None）。
-    """
-    s_nodes_list, s_text_list = [], []
-    subtask_ids   = batch.get("subtask_ids")
-    subtask_descs = batch.get("subtask_descs")
-    instructions  = batch["instructions"]
-    B = len(instructions)
-
-    w_dtype = next(model.sem_proj.parameters()).dtype
-
-    for b in range(B):
-        tree = model.get_tree(b)
-        if tree.size() == 0:
-            continue
-        descs = (subtask_descs[b] if subtask_descs and b < len(subtask_descs)
-                 else [instructions[b]])
-        if not descs:
-            continue
-        g_sub = _encode_subtask_text(model, descs, device)  # (S, d_lang)
-
-        for nid, node in tree.nodes.items():
-            # 只处理抽象节点（已提升，s != None）
-            if node.is_leaf() or node.s is None:
-                continue
-            t_idx = min(nid, subtask_ids.shape[1] - 1) if subtask_ids is not None else 0
-            sid   = int(subtask_ids[b, t_idx].item()) if subtask_ids is not None else 0
-            sid   = max(0, min(sid, len(descs) - 1))
-            # 将 node.s (d,) 投影到 d_lang 空间
-            s_proj_out = model.sem_proj(node.s.to(device=device, dtype=w_dtype))  # (d_lang,)
-            s_nodes_list.append(s_proj_out)
-            s_text_list.append(g_sub[sid].to(device=device, dtype=w_dtype))
-
-    if len(s_nodes_list) < 2:
-        return torch.zeros((), device=device)
-
-    S_nodes = torch.stack(s_nodes_list, dim=0)   # (N, d_lang)
-    S_text  = torch.stack(s_text_list,  dim=0)   # (N, d_lang)
-    return l_sem(S_nodes, S_text, temperature=loss_cfg.get("tau_sem", 0.07))
-
-
-def _compute_tree_elev_loss(model: MemoryTreeVLA, B: int, device, mlp_elev) -> torch.Tensor:
-    """
-    L_elev：对每个抽象节点，验证其 s 与子节点加权语义的一致性。
-
-    子节点可以是：
-      - 抽象节点 → 直接使用 node.s
-      - 叶节点   → 通过 mlp_elev(node.z_v) 投影到语义空间
-    """
-    elev_losses = []
-    dtype = next(mlp_elev.parameters()).dtype
-    for b in range(B):
-        tree = model.get_tree(b)
-        for nid, node in tree.nodes.items():
-            # 只处理抽象节点（有子节点且 s 有效）
-            if node.is_leaf() or node.s is None:
-                continue
-            ch_ids = node.children_ids
-            if len(ch_ids) < 1:
-                continue
-            s_ch_list = []
-            w_ch_list = []
-            for c in ch_ids:
-                child = tree.nodes[c]
-                w_ch_list.append(child.w)
-                if child.is_leaf():
-                    # 叶节点：用 mlp_elev(z_v) 获得语义代理
-                    z_v_c = child.z_v.to(device=device, dtype=dtype)
-                    with torch.no_grad():
-                        s_proxy = mlp_elev(z_v_c.unsqueeze(0)).squeeze(0)
-                    s_ch_list.append(s_proxy)
-                else:
-                    if child.s is None:
-                        continue
-                    s_ch_list.append(child.s.to(device=device, dtype=dtype))
-            if len(s_ch_list) < 1:
-                continue
-            # 在梯度计算下重新计算 s_abs（让 mlp_elev 有梯度流向）
-            # 收集所有叶子的 z_v 做加权池化（与 operations.py 保持一致）
-            leaf_zv = [tree.nodes[c].z_v.to(device=device, dtype=dtype)
-                       for c in ch_ids if tree.nodes[c].is_leaf()]
-            if leaf_zv:
-                lw = [tree.nodes[c].w for c in ch_ids if tree.nodes[c].is_leaf()]
-                lw_t = torch.tensor(lw, device=device, dtype=dtype)
-                lw_t = lw_t / lw_t.sum().clamp(min=1e-6)
-                z_pool = sum(z * w for z, w in zip(leaf_zv, lw_t))
-                s_abs = mlp_elev(z_pool.unsqueeze(0)).squeeze(0)
-            else:
-                s_abs = node.s.to(device=device, dtype=dtype)
-            elev_losses.append(l_elev(s_abs, s_ch_list, w_ch_list))
-    if not elev_losses:
-        return torch.zeros((), device=device)
-    return torch.stack(elev_losses).mean()
 
 
 # ================================================================
@@ -366,22 +242,23 @@ def train(cfg: dict):
 
     # ── 构建模型 ────────────────────────────────────────────────────
     mc = cfg["model"]
-    model = MemoryTreeVLA(
-        llm_path   = mc["llm_path"],
-        d          = mc.get("d", 256),
-        d_a        = mc.get("d_a", 7),
-        d_q        = mc.get("d_q", 84),
-        d_visual   = mc.get("d_visual", 256),
-        d_ssm      = mc.get("d_ssm", 256),
-        d_state    = mc.get("d_state", 16),
-        patch_size = mc.get("patch_size", 16),
-        H_a        = mc.get("H_a", 16),
-        n_ode      = mc.get("n_ode", 20),
-        theta_fuse = mc.get("theta_fuse", 0.65),
-        K_elev     = mc.get("K_elev", 4),
-        delta_w    = mc.get("delta_w", 0.1),
-        tau        = mc.get("tau", 0.1),
-        freeze_llm = True,
+    model = DualTreeVLA(
+        llm_path        = mc["llm_path"],
+        d               = mc.get("d", 256),
+        d_a             = mc.get("d_a", 7),
+        d_q             = mc.get("d_q", 84),
+        d_visual        = mc.get("d_visual", 256),
+        d_ssm           = mc.get("d_ssm", 256),
+        d_state         = mc.get("d_state", 16),
+        patch_size      = mc.get("patch_size", 16),
+        H_a             = mc.get("H_a", 16),
+        n_ode           = mc.get("n_ode", 20),
+        theta_fuse      = mc.get("theta_fuse", 0.65),
+        K_elev          = mc.get("K_elev", 4),
+        delta_w         = mc.get("delta_w", 0.1),
+        tau             = mc.get("tau", 0.1),
+        clip_model_name = mc.get("clip_model_name"),   # None → PatchCNN fallback
+        freeze_llm      = True,
     )
 
     n_train, n_total = freeze_for_pretrain(model)
@@ -437,7 +314,7 @@ def train(cfg: dict):
     # ── W&B 初始化 ────────────────────────────────────────────────────
     if _WANDB and is_main(accel):
         wandb.init(
-            project=cfg.get("wandb_project", "MemoryTreeVLA-pretrain"),
+            project=cfg.get("wandb_project", "DualTreeVLA-pretrain"),
             name=cfg.get("wandb_run",    f"pretrain_{int(time.time())}"),
             config=cfg,
             mode="offline",
