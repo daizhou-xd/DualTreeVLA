@@ -54,7 +54,7 @@ model:
 # ── Training ──────────────────────────────────────────────────────────────
 train:
   batch_size:    2
-  num_workers:   4
+  num_workers:   0
   epochs:        30
   lr:            3.0e-4
   weight_decay:  1.0e-4

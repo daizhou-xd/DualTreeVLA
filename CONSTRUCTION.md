@@ -183,10 +183,8 @@ SGMTS 在 GrootV 的 Mamba 树扫描（`tree_scanning.py: MinimumSpanningTree + 
 ```
 输入图像
     ↓
-[CLIP Vision Encoder] ──┬──→ 视觉特征 [B, H, W, C] ───┐
-    │                   │                             │
-    │                   └──→ 多尺度特征图 ────────────┤
-    │                                                 ▼
+[CLIP Vision Encoder] ──────→ patch 特征 [B, P, d_f] ────┐
+    │                                                       ▼
 [CLIP Text Encoder] ←── 文本/类别提示 ───────→ [语义引导树构建器]
                                                     │
                                             语义重要性图 + 树拓扑
@@ -202,14 +200,13 @@ SGMTS 在 GrootV 的 Mamba 树扫描（`tree_scanning.py: MinimumSpanningTree + 
 
 #### 视觉骨干：CLIP 双编码器（无需 mini-imagenet 预训练）
 
-> **核心思路**：CLIP 同时提供 Vision Encoder（patch 级视觉特征）和 Text Encoder（文本语义向量），两路输出共同驱动语义引导树构建器。Vision Encoder 抽取多尺度特征图，Text Encoder 将任务描述/类别提示编码为跨模态对齐的语义向量，二者在语义引导树构建器中融合，生成**语义重要性图**和**树拓扑**，再由 MambaTree 扫描层完成序列化编码。
+> **核心思路**：CLIP 同时提供 Vision Encoder（单尺度 patch 级视觉特征）和 Text Encoder（文本语义向量），两路输出共同驱动语义引导树构建器。Vision Encoder 以固定 patch_size=16 切割图像，输出 patch 特征序列 $(B, P, d_f)$，Text Encoder 将任务描述/类别提示编码为跨模态对齐的语义向量，二者在语义引导树构建器中融合，生成**语义重要性图**和**树拓扑**，再由 MambaTree 扫描层完成序列化编码。
 
 ```
 输入图像 (B, C, H, W)
       ↓
 [CLIP Vision Encoder]  ← 冻结，直接使用预训练权重
-  ├─→ 视觉特征 [B, H, W, C]          # 全分辨率空间特征
-  └─→ 多尺度特征图 (1/8, 1/16, 1/32) # 用于细粒度语义定位
+  └─→ patch 特征 [B, P, d_f]          # patch_size=16 单尺度，P = (H/16)×(W/16)
 
 文本/类别提示 (str / token_ids)
       ↓
@@ -304,7 +301,7 @@ $$Z_v \in \mathbb{R}^{P \times d_\text{visual}}$$
 
 | 机制 | GrootV（原版） | SGMTS（本工作） |
 |------|-------------|--------------|
-| 视觉特征来源 | 随机初始化骨干 | CLIP Vision Encoder（多尺度特征图） |
+| 视觉特征来源 | 随机初始化骨干 | CLIP Vision Encoder（单尺度 patch 特征，patch_size=16） |
 | 文本/语义输入 | 无 | CLIP Text Encoder（文本/类别提示 → 跨模态对齐向量） |
 | 语义重要性图 | 无 | $\sigma_i = \cos(p_i, W_g g_\text{sem})$ 空间热图 |
 | BFS 根 | 固定（隐式左上角） | 动态语义根 $r^* = \arg\max \sigma_i$ |

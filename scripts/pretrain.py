@@ -203,9 +203,12 @@ def save_ckpt(model, optimizer, epoch, step, path: Path, accel=None):
 def train(cfg: dict):
     # ── Accelerator ─────────────────────────────────────────────────
     if _ACCELERATE:
+        from accelerate import DistributedDataParallelKwargs
+        ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=True)
         accel = Accelerator(
             mixed_precision=cfg.get("mixed_precision", "bf16"),
             gradient_accumulation_steps=cfg.get("grad_accum", 1),
+            kwargs_handlers=[ddp_kwargs],
         )
         device = accel.device
     else:

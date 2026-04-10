@@ -4,10 +4,8 @@ SGMTS — Semantic-Guided Mamba Tree Scan (CONSTRUCTION.md §3.2)
 整体架构：
   输入图像
       ↓
-  [CLIP Vision Encoder] ──┬──→ 视觉特征 [B, H, W, C] ───┐
-      │                   │                             │
-      │                   └──→ 多尺度特征图 ────────────┤
-      │                                                 ▼
+  [CLIP Vision Encoder] ──────→ patch 特征 [B, P, d_f] ────┐
+      │                                                       ▼
   [CLIP Text Encoder] ←── 文本/类别提示 ───────→ [语义引导树构建器]
                                                       │
                                               语义重要性图 + 树拓扑
@@ -30,7 +28,7 @@ SGMTS — Semantic-Guided Mamba Tree Scan (CONSTRUCTION.md §3.2)
 
 视觉骨干选择:
   CLIPPatchExtractor (默认，clip_model_name 非 None):
-    使用冻结的 CLIP ViT 提取多尺度语义 patch 特征，无需 mini-imagenet 预训练。
+    使用冻结的 CLIP ViT 提取多尺度语义 patch 特征
     依赖: transformers >= 4.40.0（已在 requirements.txt 中）
   PatchCNN (fallback，clip_model_name=None):
     轻量级随机初始化 patch 投影器，适合快速实验。
@@ -162,7 +160,7 @@ class SGMTSEncoder(nn.Module):
     Semantic-Guided Mamba Tree Scan encoder (CONSTRUCTION.md §3.2).
 
     架构流程:
-      [CLIP Vision Encoder] → 视觉特征/多尺度特征图
+      [CLIP Vision Encoder] → 单尺度 patch 特征 (B, P, d_f)
       [CLIP Text Encoder]  → 文本/类别提示语义向量 g_sem
       [语义引导树构建器]   → 语义重要性图 σ + 树拓扑（MST + r*）
       [MambaTree扫描层]    → 语义增强视觉特征 Z_v → [下游任务头]
@@ -341,11 +339,12 @@ class SGMTSEncoder(nn.Module):
 
         # ── 5. Batched SSM on GPU ────────────────────────────────────────
         A = -torch.exp(self.A_log.float()).to(device)       # (d_f, d_state)
-        bfs_t    = torch.tensor(bfs_order, dtype=torch.long, device=device)
+        bfs_t_cpu = torch.tensor(bfs_order, dtype=torch.long)
+        bfs_t    = bfs_t_cpu.to(device)
         f_sorted = f[bfs_t]
 
         g_prime = self.W_g_prime(g_sem.to(device))
-        sem_bfs = sem_score[bfs_t].to(device)
+        sem_bfs = sem_score[bfs_t_cpu].to(device)
         X = (f_sorted + sem_bfs.unsqueeze(1) * g_prime.unsqueeze(0)).to(f.dtype)
 
         # Pre-compute all SSM matrices in one batched pass (no per-step exp/proj)

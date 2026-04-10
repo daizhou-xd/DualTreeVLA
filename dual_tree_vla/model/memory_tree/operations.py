@@ -185,9 +185,10 @@ def propagate_elevation_to_root(
                     weights.append(child.w)
 
         if embeds:
-            wt = torch.tensor(weights, dtype=torch.float)
+            stacked = torch.stack(embeds)
+            wt = torch.tensor(weights, dtype=torch.float, device=stacked.device)
             wt = wt / wt.sum()
-            z_pool = (torch.stack(embeds) * wt.unsqueeze(1)).sum(0).to(device)
+            z_pool = (stacked * wt.unsqueeze(1)).sum(0).to(device)
             with torch.no_grad():
                 node.s = mlp_elev(z_pool.float()).detach().cpu()
 
