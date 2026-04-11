@@ -33,6 +33,7 @@ import time
 from pathlib import Path
 from typing import Dict, List
 
+import numpy as np
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
@@ -42,7 +43,7 @@ os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 
 try:
     from accelerate import Accelerator
-    from accelerate.utils import set_seed
+    from accelerate.utils import set_seed, DistributedDataParallelKwargs
     _ACCELERATE = True
 except ImportError:
     _ACCELERATE = False
@@ -98,7 +99,7 @@ def inspect_named_modules(model: DualTreeVLA, accel=None):
     groups = {
         "LLM backbone":     model.llm,
         "SGMTS":            model.sgmts,
-        "s_proj":           model.s_proj,
+        "sem_proj":         model.sem_proj,
         "JumpAwareHead":    model.jump_head,
         "TreeSSMReadout":   model.tree_ssm,
         "MLPElevation":     model.mlp_elev,
@@ -150,6 +151,21 @@ def unfreeze_phase2(model: DualTreeVLA):
 
 
 # ================================================================
+#  Checkpoint 加载（跳过 shape 不匹配的 key）
+# ================================================================
+
+def _load_ckpt_partial(model, state_dict):
+    """Load checkpoint, silently skipping keys with shape mismatches."""
+    model_sd = model.state_dict()
+    compatible = {k: v for k, v in state_dict.items()
+                  if k in model_sd and v.shape == model_sd[k].shape}
+    skipped   = [k for k, v in state_dict.items()
+                 if k in model_sd and v.shape != model_sd[k].shape]
+    missing, unexp = model.load_state_dict(compatible, strict=False)
+    return missing, unexp, skipped
+
+
+# ================================================================
 #  Checkpoint 保存
 # ================================================================
 
@@ -164,6 +180,107 @@ def save_ckpt(model, optimizer, epoch, step, path: Path, accel=None):
 
 
 # ================================================================
+#  训练可视化（GT vs Pred 对比视频）
+# ================================================================
+
+def visualize_epoch(
+    model,
+    dataset,
+    epoch: int,
+    phase: int,
+    device: torch.device,
+    viz_dir: str,
+    episode_idx: int = 0,
+    max_frames: int = 120,
+    fps: int = 10,
+    accel=None,
+):
+    """
+    用数据集中一个固定 episode 生成「GT vs 预测」对比视频。
+    每帧下方添加文字面板，显示归一化空间里的 GT（绿色）和预测（蓝色）动作。
+    保存到 viz_dir/phase{phase}_ep{epoch:03d}.mp4。
+    """
+    try:
+        import cv2 as _cv2
+    except ImportError:
+        log_msg("[viz] cv2 not available, skipping visualization", accel)
+        return
+
+    try:
+        sample = dataset[episode_idx]
+    except Exception as e:
+        log_msg(f"[viz] dataset[{episode_idx}] failed: {e}", accel)
+        return
+
+    frames_t   = sample["frames"]       # (T, 3, H, W) float32 [0,1]
+    actions_gt = sample["actions"]      # (T, d_a)  — normalized
+    states_t   = sample["states"]       # (T, d_q)  — normalized
+    instr      = sample["instruction"]  # str
+
+    T = min(int(frames_t.shape[0]), max_frames)
+    _, C, H, W = frames_t.shape
+    PANEL = 95   # pixel height of the text panel appended below the image
+
+    # Unwrap DDP / ZeRO wrapper and switch to eval
+    raw = accel.unwrap_model(model) if (accel is not None and hasattr(accel, "unwrap_model")) else model
+    raw.eval()
+    raw.reset_trees(batch_size=1)
+
+    os.makedirs(viz_dir, exist_ok=True)
+    out_path = os.path.join(viz_dir, f"phase{phase}_ep{epoch:03d}.mp4")
+    fourcc = _cv2.VideoWriter_fourcc(*"mp4v")
+    writer = _cv2.VideoWriter(out_path, fourcc, fps, (W, H + PANEL))
+
+    def _fmt3(arr, s, e):
+        return " ".join(f"{float(v):+.2f}" for v in arr[s:e])
+
+    font = _cv2.FONT_HERSHEY_SIMPLEX
+    a_prev = None
+    all_mae: List[float] = []
+
+    with torch.no_grad():
+        for t in range(T):
+            img_t   = frames_t[t].unsqueeze(0).to(device)   # (1,3,H,W)
+            state_t = states_t[t].unsqueeze(0).to(device)   # (1,d_q)
+            a_chunk = raw.step(img_t, instr, state_t, a_prev)  # (1,H_a,d_a)
+            pred    = a_chunk[0, 0].cpu().float().numpy()       # (d_a,)
+            a_prev  = a_chunk[0, -1].unsqueeze(0)
+
+            gt_np = (actions_gt[t].float().numpy()
+                     if isinstance(actions_gt, torch.Tensor)
+                     else np.array(actions_gt[t], dtype=np.float32))
+
+            mae = float(np.abs(gt_np - pred).mean())
+            all_mae.append(mae)
+
+            # RGB → BGR for cv2
+            frame_rgb = (frames_t[t].permute(1, 2, 0).numpy() * 255).clip(0, 255).astype(np.uint8)
+            frame_bgr = _cv2.cvtColor(frame_rgb, _cv2.COLOR_RGB2BGR)
+
+            # Text panel
+            panel = np.zeros((PANEL, W, 3), dtype=np.uint8)
+            short_instr = instr[:45] + "..." if len(instr) > 45 else instr
+            _cv2.putText(panel, f"ep{episode_idx} t={t:>4}  {short_instr}",
+                         (4, 14), font, 0.33, (180, 180, 180), 1)
+            _cv2.putText(panel,
+                         f"GT   xyz:{_fmt3(gt_np,0,3)}  rot:{_fmt3(gt_np,3,6)}  g:{float(gt_np[6]):+.2f}",
+                         (4, 34), font, 0.33, (80, 255, 80), 1)
+            _cv2.putText(panel,
+                         f"Pred xyz:{_fmt3(pred,0,3)}  rot:{_fmt3(pred,3,6)}  g:{float(pred[6]):+.2f}",
+                         (4, 54), font, 0.33, (80, 150, 255), 1)
+            _cv2.putText(panel, f"MAE norm: {mae:.4f}  (mean so far: {np.mean(all_mae):.4f})",
+                         (4, 76), font, 0.38, (255, 200, 50), 1)
+
+            combined = np.concatenate([frame_bgr, panel], axis=0)  # (H+PANEL, W, 3)
+            writer.write(combined)
+
+    writer.release()
+    raw.train()
+    ep_mae = float(np.mean(all_mae)) if all_mae else 0.0
+    log_msg(f"[viz] Saved {out_path}  ({T} frames, mean MAE={ep_mae:.4f})", accel)
+
+
+# ================================================================
 #  主训练
 # ================================================================
 
@@ -172,9 +289,11 @@ def train(cfg: dict, phase: int):
 
     # ── Accelerator ─────────────────────────────────────────────────
     if _ACCELERATE:
+        ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=False)
         accel = Accelerator(
             mixed_precision=cfg.get("mixed_precision", "bf16"),
             gradient_accumulation_steps=cfg.get("grad_accum", 1),
+            kwargs_handlers=[ddp_kwargs],
         )
         device = accel.device
     else:
@@ -194,7 +313,7 @@ def train(cfg: dict, phase: int):
         root       = dc["root"],
         img_h      = dc.get("img_h", 224),
         img_w      = dc.get("img_w", 224),
-        d_q        = dc.get("d_q", 84),
+        d_q        = dc.get("d_q", 8),
         d_a        = dc.get("d_a", 7),
         max_seqlen = dc.get("max_seqlen", 64),
         normalize  = dc.get("normalize", True),
@@ -214,10 +333,11 @@ def train(cfg: dict, phase: int):
     # ── 构建模型 ────────────────────────────────────────────────────
     mc = cfg["model"]
     model = DualTreeVLA(
-        llm_path   = mc["llm_path"],
+        llm_path        = mc["llm_path"],
+        clip_model_name = mc.get("clip_model_name"),   # None → PatchCNN fallback
         d          = mc.get("d", 256),
         d_a        = mc.get("d_a", 7),
-        d_q        = mc.get("d_q", 84),
+        d_q        = mc.get("d_q", 8),
         d_visual   = mc.get("d_visual", 256),
         d_ssm      = mc.get("d_ssm", 256),
         d_state    = mc.get("d_state", 16),
@@ -237,12 +357,16 @@ def train(cfg: dict, phase: int):
     resume    = tc.get("resume_from")
     if init_ckpt and os.path.isfile(str(init_ckpt)):
         ckpt = torch.load(init_ckpt, map_location="cpu")
-        missing, unexp = model.load_state_dict(ckpt["model"], strict=False)
-        log_msg(f"{tag} 加载 {init_ckpt}  missing={len(missing)}  unexpected={len(unexp)}", accel)
+        missing, unexp, skipped = _load_ckpt_partial(model, ckpt["model"])
+        log_msg(f"{tag} 加载 {init_ckpt}  missing={len(missing)}  unexpected={len(unexp)}  shape_skip={len(skipped)}", accel)
+        if skipped:
+            log_msg(f"{tag}  shape_skipped: {skipped}", accel)
     elif resume and os.path.isfile(str(resume)):
         ckpt = torch.load(resume, map_location="cpu")
-        missing, unexp = model.load_state_dict(ckpt["model"], strict=False)
-        log_msg(f"{tag} 恢复自 {resume}  missing={len(missing)}  unexpected={len(unexp)}", accel)
+        missing, unexp, skipped = _load_ckpt_partial(model, ckpt["model"])
+        log_msg(f"{tag} 恢复自 {resume}  missing={len(missing)}  unexpected={len(unexp)}  shape_skip={len(skipped)}", accel)
+        if skipped:
+            log_msg(f"{tag}  shape_skipped: {skipped}", accel)
 
     # 冻结设置
     if phase == 1:
@@ -379,6 +503,23 @@ def train(cfg: dict, phase: int):
             best_loss = avg_loss
             save_ckpt(model, optimizer, epoch, global_step,
                       ckpt_dir / f"phase{phase}_best.pt", accel)
+
+        # ── 可视化：每 viz_every epoch 保存一次 GT vs 预测对比视频 ──────
+        viz_every = tc.get("viz_every", 1)
+        viz_dir   = str(tc.get("viz_dir", "results/viz"))
+        if viz_every > 0 and epoch % viz_every == 0 and is_main(accel):
+            visualize_epoch(
+                model       = model,
+                dataset     = dataset,
+                epoch       = epoch,
+                phase       = phase,
+                device      = device,
+                viz_dir     = os.path.join(viz_dir, f"phase{phase}"),
+                episode_idx = tc.get("viz_episode", 0),
+                max_frames  = tc.get("viz_max_frames", 120),
+                fps         = tc.get("viz_fps", 10),
+                accel       = accel,
+            )
 
     log_msg(f"{tag} 训练完成。", accel)
 

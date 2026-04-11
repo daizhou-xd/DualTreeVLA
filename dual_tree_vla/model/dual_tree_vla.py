@@ -238,7 +238,7 @@ class DualTreeVLA(nn.Module):
         ).to(device)
         llm_grad = any(p.requires_grad for p in self.llm.parameters())
         with torch.set_grad_enabled(llm_grad):
-            out = self.llm(**enc)
+            out = self.llm(**enc, use_cache=False)
         lang_hidden = out.last_hidden_state
         mask = enc["attention_mask"].unsqueeze(-1).float()
         g_lang = (lang_hidden * mask).sum(1) / mask.sum(1).clamp(min=1)
@@ -269,7 +269,7 @@ class DualTreeVLA(nn.Module):
         ).to(device)
         llm_grad = any(p.requires_grad for p in self.llm.parameters())
         with torch.set_grad_enabled(llm_grad):
-            out = self.llm(**enc)
+            out = self.llm(**enc, use_cache=False)
         mask = enc["attention_mask"].unsqueeze(-1).float()
         return (out.last_hidden_state * mask).sum(1) / mask.sum(1).clamp(min=1)
 
@@ -324,9 +324,11 @@ class DualTreeVLA(nn.Module):
 
         # 5. Fusion
         Z_fused = self.fusion(z_v_mean.unsqueeze(0), m_ctx, g_lang, pad_q)  # (1, 1, d)
+        # Broaden context: [fused_vec | SGMTS patch tokens] → (1, 1+P, d)
+        ctx = torch.cat([Z_fused, Z_v], dim=1)                              # (1, 1+P, d)
 
         # 6. Flow matching prediction
-        a_pred  = self.action_head.sample(Z_fused, device=device)  # (1, H_a, d_a)
+        a_pred  = self.action_head.sample(ctx, device=device)        # (1, H_a, d_a)
         a_hat_1 = a_pred[:, 0]                                     # (1, d_a)
 
         # 7. JumpAwareHead → p_jump
@@ -455,9 +457,11 @@ class DualTreeVLA(nn.Module):
 
             m_ctx_t = torch.stack(m_ctx_list, dim=0)           # (B, d_ssm)
             Z_fused_t = self.fusion(z_v_mean_t, m_ctx_t, g_lang, q_t)   # (B, 1, d)
+            # Broaden context: [fused_vec | SGMTS patch tokens] → (B, 1+P, d)
+            ctx_t = torch.cat([Z_fused_t, Z_v_t], dim=1)                # (B, 1+P, d)
             if not compute_flow:
-                Z_fused_t = Z_fused_t.detach()
-            all_Z_fused.append(Z_fused_t)
+                ctx_t = ctx_t.detach()
+            all_Z_fused.append(ctx_t)
 
         torch.cuda.empty_cache()
 

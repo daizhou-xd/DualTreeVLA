@@ -32,15 +32,15 @@ Usage
 -----
   # RoboCerebraBench — all 6 task types
   python eval.py \\
-      --ckpt  checkpoints/runs/phase3_best \\
-      --config configs/default.yaml \\
+      --ckpt  checkpoints/runs/phase2/phase2_best.pt \\
+      --config configs/train_phase2.yaml \\
       --dataset robocerebra_bench \\
       --bench_root dataset/RoboCerebra/RoboCerebraBench \\
       --out results/robocerebra_bench.json
 
   # RoboCerebraBench — specific task types only
   python eval.py \\
-      --ckpt  checkpoints/runs/phase3_best \\
+      --ckpt  checkpoints/runs/phase2/phase2_best.pt \\
       --dataset robocerebra_bench \\
       --bench_root dataset/RoboCerebra/RoboCerebraBench \\
       --task_types Ideal Random_Disturbance \\
@@ -48,23 +48,34 @@ Usage
 
   # RoboCerebra trainset
   python eval.py \\
-      --ckpt  checkpoints/runs/phase3_best \\
+      --ckpt  checkpoints/runs/phase2/phase2_best.pt \\
       --dataset robocerebra \\
       --data_root dataset/RoboCerebra/RoboCerebra_trainset \\
       --out results/robocerebra_train_eval.json
 
-  # LIBERO-LONG evaluation
+  # LIBERO-10 (long-horizon) evaluation
   python eval.py \\
-      --ckpt  checkpoints/runs/phase3_best \\
+      --ckpt  checkpoints/runs/phase2/phase2_best.pt \\
+      --config configs/train_phase2.yaml \\
       --dataset libero \\
-      --data_root dataset/LIBERO \\
+      --data_root dataset/datasets \\
       --libero_split long \\
-      --out results/libero_long_eval.json
+      --out results/libero10_eval.json
+
+  # LIBERO-SPATIAL / OBJECT / GOAL evaluation
+  python eval.py \\
+      --ckpt  checkpoints/runs/phase2/phase2_best.pt \\
+      --config configs/train_phase2.yaml \\
+      --dataset libero \\
+      --data_root dataset/datasets \\
+      --libero_split spatial \\
+      --out results/libero_spatial_eval.json
 
   # Quick test: limit trajectories, custom GPU
-  python eval.py --ckpt ... --dataset robocerebra_bench \\
-      --bench_root dataset/RoboCerebra/RoboCerebraBench \\
-      --device cuda:0 --subsample 4 --max_traj 20
+  python eval.py --ckpt checkpoints/runs/phase2/phase2_best.pt \\
+      --config configs/train_phase2.yaml \\
+      --dataset libero --data_root dataset/datasets --libero_split long \\
+      --device cuda:0 --max_traj 20
 """
 from __future__ import annotations
 
@@ -173,7 +184,8 @@ def load_model(ckpt_path: str, cfg: dict, device: torch.device):
 
     m_cfg = cfg.get("model", {})
     model = DualTreeVLA(
-        llm_path   = m_cfg.get("llm_path", "checkpoints/Qwen2.5-1.5B-Instruct"),
+        llm_path        = m_cfg.get("llm_path",        "checkpoints/Qwen2.5-0.5B"),
+        clip_model_name = m_cfg.get("clip_model_name", None),
         d          = m_cfg.get("d", 256),
         d_a        = m_cfg.get("d_a", 7),
         d_q        = m_cfg.get("d_q", 84),
@@ -218,9 +230,10 @@ def load_model(ckpt_path: str, cfg: dict, device: torch.device):
             sd = state.get("module", state)
     else:
         state = torch.load(ckpt_path, map_location="cpu")
-        # Training checkpoint wraps state_dict under 'model_state_dict'
+        # Training checkpoint wraps state_dict under 'model' or 'model_state_dict'
         sd = (
-            state.get("model_state_dict")
+            state.get("model")
+            or state.get("model_state_dict")
             or state.get("module")
             or state
         )
@@ -514,12 +527,12 @@ def evaluate_trajectory(
     # lets us check whether theta_fuse needs tuning.
     tree._dt_log = []
     _orig_insert = tree.insert.__func__   # unbound method
-    def _patched_insert(self, z_v, a, force_branch: bool):
+    def _patched_insert(self, z_v, a, force_branch: bool,
+                        s_current: Optional[torch.Tensor] = None):
         # Snapshot d_t (cosine distance) before calling original insert
         active_node = self.nodes.get(self.active_id)
         if active_node is not None and not active_node.is_leaf() and active_node.s is not None:
             import torch.nn.functional as _F
-            import torch as _torch
             # Use z_v distance as a proxy for semantic change
             s_before = active_node.s.float()
             d_cosine = (1.0 - _F.cosine_similarity(
@@ -527,7 +540,7 @@ def evaluate_trajectory(
                 s_before.unsqueeze(0),
             ).item())
             self._dt_log.append(d_cosine)
-        return _orig_insert(self, z_v, a, force_branch)
+        return _orig_insert(self, z_v, a, force_branch, s_current=s_current)
     import types
     tree.insert = types.MethodType(_patched_insert, tree)
 
@@ -672,6 +685,25 @@ def _eval_trajectories(
     all_results: List[Dict] = []
     t0 = time.time()
 
+    # ── Language encoding cache ─────────────────────────────────────────
+    # _encode_language runs the full LLM forward for every step() call.
+    # LIBERO-10 has only 10 unique instructions; cache them to avoid
+    # ~379×128 = 48 K redundant LLM passes.
+    _lang_cache: Dict = {}
+    _orig_encode = model._encode_language.__func__   # unbound method
+
+    def _cached_encode(self, instructions: List[str], dev: torch.device):
+        key = tuple(instructions)
+        if key not in _lang_cache:
+            result = _orig_encode(self, instructions, dev)
+            _lang_cache[key] = (result[0].detach().cpu(), result[1].detach().cpu())
+        h, g = _lang_cache[key]
+        return h.to(dev), g.to(dev)
+
+    import types as _types
+    model._encode_language = _types.MethodType(_cached_encode, model)
+    # ────────────────────────────────────────────────────────────────────
+
     for idx in range(n_traj):
         sample = ds[idx]
 
@@ -725,6 +757,8 @@ def _eval_trajectories(
                 f"({fps:.2f} traj/s)"
             )
 
+    # Restore original _encode_language
+    model._encode_language = _types.MethodType(_orig_encode, model)
     return all_results
 
 
@@ -775,6 +809,152 @@ def _print_semantic_diagnosis(summary: Dict[str, float]) -> None:
     print("  4. s_proj weight norms are near-zero (see [DIAG] lines above).")
     print("!" * 64)
 
+
+# ================================================================
+#  LIBERO structured evaluation
+# ================================================================
+
+# libero_split value → local directory name under the datasets root
+_LIBERO_SPLIT_DIRS: Dict[str, str] = {
+    "long":    "libero_10",
+    "spatial": "libero_spatial",
+    "object":  "libero_object",
+    "goal":    "libero_goal",
+}
+
+
+def _run_libero_evaluation(
+    args: argparse.Namespace,
+    cfg: dict,
+    model,
+    device: torch.device,
+    data_cfg: dict,
+    max_seqlen: int,
+) -> Dict:
+    """
+    LIBERO offline evaluation with per-task breakdown.
+
+    Data-root resolution (priority order):
+      1. --data_root already contains meta/ or data/ → use as-is.
+      2. --data_root is a parent directory; append the sub-folder
+         determined by --libero_split (e.g. 'long' → 'libero_10').
+      3. Neither exists → raise FileNotFoundError with a helpful message.
+
+    Per-task output
+    ---------------
+    Results are grouped by ``instruction`` (= LIBERO task sentence).
+    LIBERO-10 has 10 unique tasks × ~50 episodes each; the per-task
+    table shows episode count, mean L1/L2, tree node/depth, branch counts.
+    """
+    from dual_tree_vla.dataset.libero import LiberoDataset
+
+    if args.data_root is None:
+        raise ValueError("--data_root is required for --dataset libero")
+
+    split     = args.libero_split                          # "long"|"spatial"|"object"|"goal"
+    split_dir = _LIBERO_SPLIT_DIRS.get(split, f"libero_{split}")
+    root_path = Path(args.data_root)
+
+    def _is_split_root(p: Path) -> bool:
+        return (p / "meta").is_dir() or (p / "data").is_dir()
+
+    if not _is_split_root(root_path):
+        candidate = root_path / split_dir
+        if candidate.exists():
+            root_path = candidate
+        else:
+            raise FileNotFoundError(
+                f"Cannot find LIBERO-{split} data.\n"
+                f"  Tried : {args.data_root}\n"
+                f"  Tried : {candidate}\n"
+                f"  Expected a directory containing meta/ and data/ sub-folders.\n"
+                f"  Download: python scripts/download_data.py --libero"
+            )
+
+    print(f"Building LIBERO-{split.upper()} dataset ...")
+    print(f"  Root: {root_path}")
+
+    ds = LiberoDataset(
+        root       = str(root_path),
+        img_h      = data_cfg.get("img_h", 224),
+        img_w      = data_cfg.get("img_w", 224),
+        max_seqlen = max_seqlen,
+        d_q        = cfg.get("model", {}).get("d_q", 84),
+        d_a        = cfg.get("model", {}).get("d_a", 7),
+        normalize  = data_cfg.get("normalize", True),
+    )
+
+    n_traj = len(ds)
+    if args.max_traj is not None:
+        n_traj = min(n_traj, args.max_traj)
+    print(f"Evaluating {n_traj} / {len(ds)} episodes ...")
+
+    all_results = _eval_trajectories(
+        model, ds, n_traj, device,
+        has_subtask_labels=False,
+        boundary_tol=args.boundary_tol,
+        print_tree=args.print_tree,
+    )
+
+    # ── Per-task breakdown ────────────────────────────────────────────
+    # Group by language instruction (unique task identifier in LIBERO)
+    task_groups: Dict[str, List[Dict]] = {}
+    for r in all_results:
+        key = r.get("instruction", "unknown")
+        task_groups.setdefault(key, []).append(r)
+
+    split_tag = f"LIBERO-{split.upper()}"
+    W         = 72
+    COL_TASK  = 44
+    print(f"\n{'=' * W}")
+    print(f"  PER-TASK RESULTS  ({split_tag},  {len(task_groups)} tasks)")
+    print(f"{'=' * W}")
+    print(
+        f"  {'#':<3}  {'Task':<{COL_TASK}}  {'n':>4}  "
+        f"{'L1':>7}  {'L2':>7}  {'nodes':>6}  {'depth':>5}  {'brch':>4}"
+    )
+    print(f"  {'-' * (W - 2)}")
+
+    per_task_results: Dict[str, Dict] = {}
+    for ti, (task, rows) in enumerate(sorted(task_groups.items()), 1):
+        ts = aggregate_results(rows, has_subtask_labels=False)
+        per_task_results[task] = {"n_episodes": len(rows), "metrics": ts}
+        task_trunc = task[:COL_TASK] if len(task) > COL_TASK else task
+        print(
+            f"  {ti:<3}  {task_trunc:<{COL_TASK}}  {len(rows):>4}  "
+            f"{ts.get('action_l1', 0):>7.4f}  {ts.get('action_l2', 0):>7.4f}  "
+            f"{ts.get('tree_nodes', 0):>6.1f}  {ts.get('tree_depth', 0):>5.1f}  "
+            f"{ts.get('tree_branches', 0):>4.1f}"
+        )
+
+    # ── Overall summary ───────────────────────────────────────────────
+    overall = aggregate_results(all_results, has_subtask_labels=False)
+    _print_summary_table(f"OVERALL SUMMARY — {split_tag}", overall)
+    _print_semantic_diagnosis(overall)
+
+    # ── Save JSON ─────────────────────────────────────────────────────
+    if args.out:
+        out_path = Path(args.out)
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "config":          args.config,
+            "checkpoint":      args.ckpt,
+            "dataset":         "libero",
+            "libero_split":    split,
+            "data_root":       str(root_path),
+            "n_episodes":      n_traj,
+            "n_tasks":         len(task_groups),
+            "overall_summary": overall,
+            "per_task":        per_task_results,
+            "per_episode":     all_results,
+        }
+        with open(out_path, "w") as f:
+            json.dump(payload, f, indent=2)
+        print(f"\nResults saved to {out_path}")
+
+    return overall
+
+
 # ================================================================
 #  Main evaluation loop
 # ================================================================
@@ -822,18 +1002,10 @@ def run_evaluation(args: argparse.Namespace):
             subsample  = subsample,
             max_seqlen = max_seqlen,
         )
-    else:   # libero
-        if args.data_root is None:
-            raise ValueError("--data_root is required for dataset=libero")
-        from dual_tree_vla.dataset.libero import LiberoDataset
-        ds = LiberoDataset(
-            root       = args.data_root,
-            img_h      = data_cfg.get("img_h", 224),
-            img_w      = data_cfg.get("img_w", 224),
-            max_seqlen = max_seqlen,
-            d_q        = cfg.get("model", {}).get("d_q", 84),
-        )
+    else:   # libero — full per-task evaluation
+        return _run_libero_evaluation(args, cfg, model, device, data_cfg, max_seqlen)
 
+    # ── Shared evaluation path (robocerebra trainset) ─────────────────
     n_traj = len(ds)
     if args.max_traj is not None:
         n_traj = min(n_traj, args.max_traj)
@@ -857,7 +1029,6 @@ def run_evaluation(args: argparse.Namespace):
             "config":         args.config,
             "checkpoint":     args.ckpt,
             "dataset":        args.dataset,
-            "libero_split":   args.libero_split if args.dataset == "libero" else None,
             "n_trajectories": n_traj,
             "summary":        summary,
             "per_trajectory": all_results,

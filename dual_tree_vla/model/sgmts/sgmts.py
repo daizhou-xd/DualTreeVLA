@@ -74,6 +74,16 @@ class CLIPPatchExtractor(nn.Module):
             nn.LayerNorm(d_f),
         )
 
+        # CLIP 标准图像归一化常数（OpenAI CLIP ViT-B/16）
+        self.register_buffer(
+            'clip_mean',
+            torch.tensor([0.48145466, 0.4578275, 0.40821073]).view(1, 3, 1, 1)
+        )
+        self.register_buffer(
+            'clip_std',
+            torch.tensor([0.26862954, 0.26130258, 0.27577711]).view(1, 3, 1, 1)
+        )
+
     def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, int, int]:
         """
         Args:
@@ -86,6 +96,9 @@ class CLIPPatchExtractor(nn.Module):
         B, C, H, W = x.shape
         ps = self.patch_size
         nH, nW = H // ps, W // ps
+
+        # 将 [0,1] 图像归一化为 CLIP 标准 (mean/std) 格式
+        x = (x.float() - self.clip_mean) / self.clip_std
 
         with torch.no_grad():
             out = self.clip(pixel_values=x)

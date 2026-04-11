@@ -23,21 +23,21 @@ wandb_project: "DualTreeVLA-phase2"
 data:
   # Same LIBERO datasets as Phase 1 (LeRobot v2 parquet + video format)
   # Download: python scripts/download_data.py --libero
-  root:        "dataset/LIBERO/libero_10"
+  root:        "dataset/datasets/libero_10"
   img_h:       224
   img_w:       224
-  d_q:         84
+  d_q:         8
   d_a:         7
   max_seqlen:  128       # longer sequences for memory tree reinforcement
   normalize:   true
 
 # ── Model ─────────────────────────────────────────────────────────────────
 model:
-  llm_path:    "checkpoints/Qwen2.5-1.5B-Instruct"  # upgrade to stronger LLM
+  llm_path:    "checkpoints/Qwen2.5-0.5B"  # must match Phase 1 checkpoint (hidden=896)
   clip_model_name: "checkpoints/CLIP/clip-vit-base-patch16"
   d:           256
   d_a:         7
-  d_q:         84
+  d_q:         8
   d_visual:    256
   d_ssm:       256
   d_state:     16

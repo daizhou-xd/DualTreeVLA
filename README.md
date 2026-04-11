@@ -23,6 +23,7 @@
    - [PyTorch 安装](#pytorch-安装)
    - [Flash Attention 安装](#flash-attention-安装)
    - [DeepSpeed 安装](#deepspeed-安装)
+   - [LIBERO 仿真环境（仿真评估专用）](#libero-仿真环境仿真评估专用)
 3. [数据准备](#数据准备)
    - [RoboCerebra 训练集](#robocerebra-训练集)
    - [RoboCerebraBench](#robocerebrabench)
@@ -40,7 +41,9 @@
    - [评估指标](#评估指标)
    - [RoboCerebraBench 评估](#robocerebrabench-评估)
    - [RoboCerebra 训练集评估](#robocerebra-训练集评估)
-   - [LIBERO 评估](#libero-评估)
+   - [LIBERO 离线评估](#libero-离线评估)
+   - [LIBERO 仿真成功率评估（单进程）](#libero-仿真成功率评估)
+   - [LIBERO 仿真成功率评估（服务端+客户端）](#libero-仿真成功率评估服务端客户端)
    - [结果解读](#结果解读)
 8. [常见问题](#常见问题)
 
@@ -90,7 +93,10 @@ DualTreeVLA/
 │   ├── train.py              # Phase 1 / 2 训练主入口
 │   ├── train_phase1.sh       # Phase 1 多卡启动脚本
 │   ├── train_phase2.sh       # Phase 2 多卡启动脚本（ZeRO-3）
-│   └── eval.py               # 离线评估脚本
+│   ├── eval.py               # 离线轨迹评估（L1/L2，teacher-forcing）
+│   ├── eval_libero_sim.py    # LIBERO 仿真成功率评估（单进程）
+│   ├── eval_server.py        # LIBERO 评估：WebSocket 推理服务端（GPU 节点）
+│   └── eval_client.py        # LIBERO 评估：WebSocket 仿真客户端
 ├── checkpoints/
 │   ├── Qwen2.5-0.5B/         # LLM 权重（已预置）
 │   └── Qwen2.5-1.5B-Instruct/
@@ -207,6 +213,44 @@ ds_report
 ```bash
 pip install wandb
 wandb login   # 令牌保存在 ~/.netrc，只需执行一次
+```
+
+---
+
+### LIBERO 仿真环境（仿真评估专用）
+
+> **仅运行 `eval_libero_sim.py`（MuJoCo 在线推理成功率评估）时才需要安装**。离线 `eval.py` 不依赖这些包。
+
+**版本严格要求**：`robosuite` 必须使用 `1.4.0`，更新版本会导致 `single_arm_env` 导入失败。
+
+```bash
+# 1. 安装 LIBERO 仿真依赖（版本钉死）
+pip install robosuite==1.4.0
+pip install bddl==1.0.1
+pip install easydict einops thop cloudpickle gym==0.25.2 future matplotlib
+
+# 2. 安装 LIBERO Python 包（从子目录）
+pip install -e dataset/LIBERO
+
+# 3. 验证
+python -c "
+import robosuite; print('robosuite', robosuite.__version__)
+import bddl;       print('bddl OK')
+import libero;     print('libero OK')
+"
+```
+
+**无头渲染（服务器 / 无显示器）**：脚本默认设置 `MUJOCO_GL=osmesa`。若 osmesa 未安装：
+
+```bash
+# 方式一：conda 安装 osmesa（推荐，无 sudo）
+conda install -c conda-forge mesalib -y
+
+# 方式二：切换为 EGL（需要 NVIDIA EGL 支持）
+export MUJOCO_GL=egl
+
+# 方式三：apt 安装（需要 sudo）
+sudo apt-get install -y libosmesa6-dev
 ```
 
 ---
@@ -413,25 +457,25 @@ Checkpoint 保存至 `checkpoints/runs/pretrain/`，最优模型为 `pretrain_be
 
 ### Phase 1 — FlowMatching 热身（LIBERO）
 
-冻结双树与 LLM，仅训练 CrossModalFusion 和 FlowMatchingActionHead：
+冻结双树与 LLM，仅训练 CrossModalFusion 和 FlowMatchingActionHead。
+`train.init_from` 默认指向预训练输出 `checkpoints/runs/pretrain/pretrain_best.pt`，请确保已完成预训练。
 
 ```bash
-# 单卡调试（需先完成预训练）
-python scripts/train.py --config configs/train_phase1.yaml --phase 1
+cd /data/wyx/zd/DualTreeVLA
+conda activate dualtree
 
-# 多卡
+# 8 GPU（推荐，ZeRO-2）
 bash scripts/train_phase1.sh
 
-# 指定 GPU 数量
-bash scripts/train_phase1.sh 4
+# 指定 GPU 数量（如 4 卡）
+CUDA_VISIBLE_DEVICES=0,1,2,3 bash scripts/train_phase1.sh 4
+
+# 单卡调试
+python scripts/train.py --config configs/train_phase1.yaml --phase 1
 ```
 
-配置文件 `configs/train_phase1.yaml` 中 `model.pretrain_ckpt` 指向预训练输出：
-
-```yaml
-model:
-  pretrain_ckpt: "checkpoints/runs/pretrain/pretrain_best.pt"
-```
+Checkpoint 保存至 `checkpoints/runs/phase1/`，最优模型为 `phase1_best.pt`。
+训练过程可视化视频保存至 `results/viz/phase1/phase1_ep001.mp4`，…（详见[训练可视化](#训练可视化gt-vs-预测对比视频)）。
 
 ---
 
@@ -495,6 +539,44 @@ wandb sync wandb/offline-run-*
 ```
 
 各阶段 wandb 项目名通过对应 yaml 中的 `wandb_project` 字段配置。
+
+---
+
+### 训练可视化（GT vs 预测对比视频）
+
+`train.py` 每个 epoch 结束后自动用数据集中一个固定 episode 生成对比视频，
+无需仿真环境，直接观察 flow matching 收敛情况。
+
+视频保存位置：`results/viz/phase{1,2}/phase{1,2}_ep{epoch:03d}.mp4`
+
+每帧内容：
+```
+┌────────────────────────────────────┐
+│  观测图像（agentview, 224×224）     │
+├────────────────────────────────────┤
+│ ep0 t=42  pick up the bowl ...     │  ← 灰色：任务描述
+│ GT   xyz:+0.12 +0.03 -0.04  g:+1  │  ← 绿色：归一化空间 GT 动作
+│ Pred xyz:+0.48 +0.25 +0.15  g:+0  │  ← 蓝色：模型预测动作
+│ MAE norm: 0.312  (mean: 0.287)     │  ← 黄色：逐步 / 全集平均 MAE
+└────────────────────────────────────┘
+```
+
+**收敛参考**：
+- MAE > 0.3：flow head 尚未收敛，仿真评估意义不大
+- MAE < 0.1：GT 与 Pred 方向基本一致，可开始仿真评估
+
+可在 yaml 的 `train:` 块中调整可视化参数：
+
+```yaml
+train:
+  viz_every:       1       # 每 N epoch 保存一次；0 = 禁用
+  viz_dir:         "results/viz"
+  viz_episode:     0       # 使用数据集第几个 episode
+  viz_max_frames:  120     # 最多截取帧数（viz_fps=10 → 12 秒）
+  viz_fps:         10
+```
+
+> **依赖**：仅需 `cv2`（`pip install opencv-python`），无需 `imageio` 或仿真环境。
 
 ---
 
@@ -587,7 +669,7 @@ python scripts/eval.py \
 
 ---
 
-### LIBERO 评估
+### LIBERO 离线评估
 
 ```bash
 # LIBERO-10（主要测试集）
@@ -609,6 +691,121 @@ for SPLIT in spatial object goal long; do
         --out results/libero_${SPLIT}_eval.json
 done
 ```
+
+---
+
+### LIBERO 仿真成功率评估
+
+`eval_libero_sim.py` 直接运行 MuJoCo 仿真，统计每个任务的**真实成功率（SR）**，不依赖预录轨迹。
+
+> 需要先按 [LIBERO 仿真环境](#libero-仿真环境仿真评估专用) 一节完成依赖安装。
+
+**单进程模式**：模型和仿真在同一进程中运行。
+
+```bash
+conda activate dualtree
+cd /path/to/DualTreeVLA
+
+# LIBERO-10（10 个任务，每任务 20 rollout）
+python scripts/eval_libero_sim.py \
+    --ckpt  checkpoints/runs/phase2/phase2_best.pt \
+    --config configs/train_phase2.yaml \
+    --suite libero_10 \
+    --num_episodes 20 \
+    --out results/libero10_sim_eval.json
+
+# 快速验证（每任务 3 rollout）
+python scripts/eval_libero_sim.py \
+    --ckpt  checkpoints/runs/phase2/phase2_best.pt \
+    --config configs/train_phase2.yaml \
+    --suite libero_10 \
+    --num_episodes 3 \
+    --out results/libero10_sim_quick.json
+
+# 其他子集
+python scripts/eval_libero_sim.py \
+    --ckpt  checkpoints/runs/phase2/phase2_best.pt \
+    --suite libero_spatial \
+    --num_episodes 20
+```
+
+---
+
+### LIBERO 仿真成功率评估（服务端+客户端）
+
+模仿 Evo-1 的 Server/Client 架构：GPU 推理节点与 MuJoCo 仿真节点用 WebSocket 分离，
+也可在同一台机器上两个终端分别运行。
+
+```
+eval_server.py  ←── WebSocket ──→  eval_client.py
+(GPU 节点，模型)                    (CPU/GPU，MuJoCo 仿真)
+```
+
+**步骤一：启动推理服务端**（GPU 节点）
+
+```bash
+conda activate dualtree
+cd /path/to/DualTreeVLA
+
+python scripts/eval_server.py \
+    --ckpt   checkpoints/runs/phase2/phase2_best.pt \
+    --config configs/train_phase2.yaml \
+    --port   9000
+# 输出：[Server] Listening on ws://0.0.0.0:9000
+```
+
+**步骤二：启动仿真客户端**（另开终端或远程节点）
+
+```bash
+conda activate dualtree
+cd /path/to/DualTreeVLA
+
+# 评估所有 4 个 suite
+python scripts/eval_client.py \
+    --server  ws://127.0.0.1:9000 \
+    --suites  libero_spatial libero_object libero_goal libero_10 \
+    --num_episodes 10 \
+    --out results/all_suites_eval.json
+
+# 只评估 libero_10
+python scripts/eval_client.py \
+    --server ws://127.0.0.1:9000 \
+    --suite  libero_10 \
+    --num_episodes 10 \
+    --save_video
+
+# 快速确认（2 任务 × 3 rollout）
+python scripts/eval_client.py \
+    --server ws://127.0.0.1:9000 \
+    --suite  libero_10 \
+    --num_episodes 3 \
+    --max_task_id 2
+```
+
+**客户端常用参数**：
+
+| 参数 | 默认值 | 说明 |
+|---|---|---|
+| `--server` | `ws://127.0.0.1:9000` | 服务端 WebSocket URL |
+| `--suite` / `--suites` | `libero_10` | 单个或多个 suite（空格分隔） |
+| `--num_episodes` | `10` | 每任务 rollout 次数 |
+| `--max_steps` | 自动 | 每 rollout 最大步数 |
+| `--horizon` | `16` | 每次推理后执行的动作步数 |
+| `--save_video` | 关闭 | 保存每 episode MP4 至 `--video_dir` |
+| `--gripper_thresh` | `0.0` | 夹爪二值化阈值（> thresh → 开 +1） |
+| `--out` | 不保存 | 结果保存为 JSON |
+
+**服务端常用参数**：
+
+| 参数 | 默认值 | 说明 |
+|---|---|---|
+| `--ckpt` | 必填 | Phase 2 checkpoint 路径 |
+| `--config` | `configs/train_phase2.yaml` | 模型配置 YAML |
+| `--port` | `9000` | 监听端口 |
+| `--host` | `0.0.0.0` | 绑定地址（`0.0.0.0` = 全部网卡） |
+| `--stats` | 自动检测 | stats.json 路径 |
+
+> **依赖**：`pip install "websockets>=12.0"`（已加入 `requirements.txt`）
 
 ---
 
@@ -697,6 +894,46 @@ model:
 
 ```bash
 # 增加 DataLoader workers（yaml 的 train.num_workers: 8）
+```
+
+### 7. `robosuite.environments.manipulation.single_arm_env` 导入失败
+
+```bash
+# robosuite 版本必须为 1.4.0，新版本已移除该模块路径
+pip uninstall robosuite -y
+pip install robosuite==1.4.0
+```
+
+### 8. LIBERO 仿真黑屏 / `No such display` / osmesa 报错
+
+```bash
+# 服务器无显示器时，必须使用软件渲染
+export MUJOCO_GL=osmesa   # 或 egl（需 NVIDIA EGL）
+
+# 验证 osmesa 可用
+python -c "import mujoco; import os; os.environ['MUJOCO_GL']='osmesa'; print('osmesa OK')"
+
+# 若 osmesa 缺失，conda 无 sudo 安装
+conda install -c conda-forge mesalib -y
+```
+
+### 9. `No module named 'bddl'` / `easydict'` / `gym'`
+
+```bash
+# 一次性安装 LIBERO 仿真全部依赖
+pip install bddl==1.0.1 easydict einops thop cloudpickle gym==0.25.2 future matplotlib
+```
+
+### 10. LIBERO 仿真初始化极慢（首次 > 5 min）
+
+robosuite 首次运行会下载并编译 MuJoCo asset，属于正常现象，后续运行会使用缓存。若服务器无外网，提前将 `~/.mujoco` 目录从有网机器复制过去。
+
+---
+
+### 11. `websockets` 未安装（eval_server / eval_client）
+
+```bash
+pip install "websockets>=12.0"
 ```
 
 ---
