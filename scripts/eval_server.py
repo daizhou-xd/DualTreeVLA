@@ -1,70 +1,30 @@
-"""
-DualTreeVLA — WebSocket Inference Server
-=========================================
+# DualTreeVLA — WebSocket Inference Server
+# Based on Evo-1's Evo1_server.py
+#
+# Usage:
+#   python scripts/eval_server.py
+#   (edit ckpt_dir / config_path / port below)
 
-Loads the trained DualTreeVLA model and serves action predictions over a
-WebSocket connection.  The paired simulation client is ``eval_client.py``.
-
-Protocol (JSON over WebSocket)
--------------------------------
-Client → Server:
-  {"type": "reset"}
-      Reset the hierarchical memory tree for a new episode.
-      Server replies: {"status": "ok"}
-
-  {"type": "infer",
-   "image":       [H×W×3 uint8 flat list],   # agentview, already flipped
-   "state":       [8 floats, raw physical],
-   "instruction": "<task string>"}
-      Run one model.step() call.
-      Server replies: {"actions": [[7 floats raw] × H_a]}
-      Actions are already denormalized to physical scale.
-
-Usage
------
-  # On the GPU server:
-  python scripts/eval_server.py \\
-      --ckpt  checkpoints/runs/phase2/phase2_best.pt \\
-      --config configs/train_phase2.yaml \\
-      --stats dataset/datasets/libero_10/meta/stats.json \\
-      --port  9000
-
-  # Then launch the client in another terminal:
-  python scripts/eval_client.py --server ws://127.0.0.1:9000 ...
-"""
-from __future__ import annotations
-
-import argparse
-import asyncio
-import json
-import os
 import sys
-from pathlib import Path
-from typing import Optional
-
+import os
+import asyncio
+import websockets
 import numpy as np
+import cv2
+import json
 import torch
 import yaml
+from pathlib import Path
 
-# ── Project root ─────────────────────────────────────────────────────────
-_PROJ_ROOT = Path(__file__).parent.parent
-sys.path.insert(0, str(_PROJ_ROOT))
+sys.path.insert(0, str(Path(__file__).parent.parent))
 
-import websockets  # pip install websockets>=12.0
+from dual_tree_vla.model import DualTreeVLA
 
 
-# ================================================================
-#  Action normalization  (z-score, same as LiberoDataset)
-# ================================================================
-
-class ActionNorm:
-    """Load stats.json and expose normalize_state / denormalize_action."""
-
-    def __init__(self, stats_path: Optional[str]):
-        self._a_mean: Optional[np.ndarray] = None
-        self._a_std:  Optional[np.ndarray] = None
-        self._s_mean: Optional[np.ndarray] = None
-        self._s_std:  Optional[np.ndarray] = None
+# ========= Normalizer (z-score, matches LiberoDataset) =========
+class Normalizer:
+    def __init__(self, stats_path):
+        self._a_mean = self._a_std = self._s_mean = self._s_std = None
         if stats_path and os.path.isfile(stats_path):
             with open(stats_path) as f:
                 stats = json.load(f)
@@ -77,14 +37,9 @@ class ActionNorm:
                 self._s_mean = np.array(stats[sk]["mean"], dtype=np.float32)
                 self._s_std  = np.array(stats[sk]["std"],  dtype=np.float32)
                 self._s_std  = np.where(self._s_std < 1e-6, 1.0, self._s_std)
-            print(f"[Server] Loaded norm stats: {stats_path}")
+            print(f"Loaded norm stats: {stats_path}")
         else:
-            print("[Server][WARN] No stats.json — actions will NOT be denormalized. "
-                  "Pass --stats to fix.")
-
-    @property
-    def available(self) -> bool:
-        return self._a_mean is not None
+            print("⚠️  No stats.json found — actions will NOT be denormalized.")
 
     def normalize_state(self, state: np.ndarray) -> np.ndarray:
         if self._s_mean is None:
@@ -103,17 +58,10 @@ class ActionNorm:
         return out
 
 
-# ================================================================
-#  Model loading
-# ================================================================
-
-def load_config(path: str) -> dict:
-    with open(path) as f:
-        return yaml.safe_load(f)
-
-
-def load_model(ckpt_path: str, cfg: dict, device: torch.device):
-    from dual_tree_vla.model import DualTreeVLA
+# ========= Model loading =========
+def load_model_and_normalizer(ckpt_path, config_path, stats_override=None):
+    with open(config_path) as f:
+        cfg = yaml.safe_load(f)
 
     m = cfg.get("model", {})
     model = DualTreeVLA(
@@ -133,40 +81,52 @@ def load_model(ckpt_path: str, cfg: dict, device: torch.device):
         delta_w     = m.get("delta_w",     0.1),
         tau         = m.get("tau",         0.1),
         freeze_llm  = False,
-    )
+    ).eval()
 
-    state = torch.load(ckpt_path, map_location="cpu")
+    ckpt = torch.load(ckpt_path, map_location="cpu")
     sd = (
-        state.get("model")
-        or state.get("model_state_dict")
-        or state.get("module")
-        or state
+        ckpt.get("model")
+        or ckpt.get("model_state_dict")
+        or ckpt.get("module")
+        or ckpt
     )
     model_sd = model.state_dict()
     sd_clean = {k: v for k, v in sd.items()
                 if k in model_sd and v.shape == model_sd[k].shape}
     skipped = len(sd) - len(sd_clean)
     if skipped:
-        print(f"[Server][WARN] Skipped {skipped} shape-mismatched keys")
-
+        print(f"⚠️  Skipped {skipped} shape-mismatched checkpoint keys")
     missing, unexpected = model.load_state_dict(sd_clean, strict=False)
     if missing:
-        print(f"[Server][WARN] Missing ({len(missing)}): {missing[:4]}")
+        print(f"⚠️  Missing  ({len(missing)}): {missing[:4]}")
     if unexpected:
-        print(f"[Server][WARN] Unexpected ({len(unexpected)}): {unexpected[:4]}")
+        print(f"⚠️  Unexpected ({len(unexpected)}): {unexpected[:4]}")
 
-    model.to(device).eval()
-    print(f"[Server] Model loaded on {device}. "
-          f"sem_proj norm={sum(p.norm().item() for p in model.sem_proj.parameters()):.3f}")
-    return model
+    model = model.to("cuda")
+
+    # Resolve stats.json path
+    if stats_override and os.path.isfile(stats_override):
+        stats_path = stats_override
+    else:
+        data_root = cfg.get("data", {}).get("root", "")
+        proj = Path(__file__).parent.parent
+        stats_path = None
+        for cand in [
+            proj / data_root / "meta" / "stats.json",
+            proj / data_root / "stats.json",
+            Path(data_root) / "meta" / "stats.json",
+        ]:
+            if cand.is_file():
+                stats_path = str(cand)
+                break
+
+    normalizer = Normalizer(stats_path)
+    d_q = m.get("d_q", 8)
+    return model, normalizer, d_q
 
 
-# ================================================================
-#  Language caching (per server lifetime)
-# ================================================================
-
+# ========= Language cache (avoid repeated LLM forward) =========
 def patch_lang_cache(model):
-    """Memoize _encode_language to avoid repeated LLM forward passes."""
     import types
     _cache: dict = {}
     _orig = model._encode_language.__func__
@@ -183,143 +143,101 @@ def patch_lang_cache(model):
     model._encode_language = types.MethodType(_cached, model)
 
 
-# ================================================================
-#  WebSocket handler
-# ================================================================
+# ========= Decode image from JSON list =========
+def decode_image_from_list(img_list, img_size=224):
+    img_array = np.array(img_list, dtype=np.uint8)   # (H, W, 3) RGB
+    if img_array.shape[0] != img_size or img_array.shape[1] != img_size:
+        img_array = cv2.resize(img_array, (img_size, img_size))
+    img_t = (
+        torch.from_numpy(img_array.astype(np.float32) / 255.0)
+        .permute(2, 0, 1)
+        .unsqueeze(0)
+        .to("cuda")
+    )   # (1, 3, H, W)
+    return img_t
 
-async def handle_client(
-    websocket,
-    model,
-    action_norm: ActionNorm,
-    device: torch.device,
-    img_size: int,
-    d_q: int,
-):
-    """Handle one WebSocket connection (one evaluation run)."""
-    import cv2
 
-    print("[Server] Client connected")
+# ========= Inference from JSON dict =========
+def infer_from_json_dict(data: dict, model, normalizer, d_q: int):
+    img_t   = decode_image_from_list(data["image"])
+
+    state_raw = np.array(data["state"], dtype=np.float32)
+    if len(state_raw) < d_q:
+        state_raw = np.pad(state_raw, (0, d_q - len(state_raw)))
+    else:
+        state_raw = state_raw[:d_q]
+    state_norm = normalizer.normalize_state(state_raw)
+    state_t = torch.from_numpy(state_norm).unsqueeze(0).to("cuda")   # (1, d_q)
+
+    prompt = data["prompt"]
+
+    with torch.no_grad():
+        a_chunk = model.step(img_t, prompt, state_t)   # (1, H_a, d_a)
+    a_np = a_chunk[0].cpu().float().numpy()            # (H_a, d_a)
+
+    # Debug: print raw z-score vs denormalized action for first slot
+    a0_denorm = normalizer.denormalize_action(a_np[0].copy())
+    print(f"  [dbg] raw z-score a[0]: {np.round(a_np[0], 3).tolist()}")
+    print(f"  [dbg] denormed   a[0]: {np.round(a0_denorm, 3).tolist()}")
+
+    actions_out = []
+    for h in range(a_np.shape[0]):
+        a_raw = normalizer.denormalize_action(a_np[h].copy())
+        actions_out.append(a_raw.tolist())
+
+    return actions_out
+
+
+# ========= WebSocket handler =========
+async def handle_request(websocket, model, normalizer, d_q):
+    print("Client connected")
     try:
-        async for raw_msg in websocket:
-            data = json.loads(raw_msg)
-            msg_type = data.get("type", "infer")
+        async for message in websocket:
+            json_data = json.loads(message)
 
-            # ── Reset ─────────────────────────────────────────────────
-            if msg_type == "reset":
+            # Reset HMT trees for new episode
+            if json_data.get("type") == "reset":
                 model.reset_trees(batch_size=1)
                 await websocket.send(json.dumps({"status": "ok"}))
-                print("[Server] Trees reset for new episode")
+                print("Trees reset for new episode")
                 continue
 
-            # ── Infer ─────────────────────────────────────────────────
-            # Decode image: client sends (H, W, 3) uint8 as nested list
-            img_arr = np.array(data["image"], dtype=np.uint8)   # (H, W, 3) RGB
-            if img_arr.shape[0] != img_size or img_arr.shape[1] != img_size:
-                img_arr = cv2.resize(img_arr, (img_size, img_size))
-            # [0,1] float tensor — CLIP normalization is handled inside
-            # CLIPPatchExtractor.forward() so we just scale to [0,1]
-            img_t = (
-                torch.from_numpy(img_arr.astype(np.float32) / 255.0)
-                .permute(2, 0, 1)
-                .unsqueeze(0)
-                .to(device)
-            )  # (1, 3, H, W)
-
-            # Decode state: raw physical values (8-dim for LIBERO)
-            state_raw = np.array(data["state"], dtype=np.float32)
-            if len(state_raw) < d_q:
-                state_raw = np.pad(state_raw, (0, d_q - len(state_raw)))
-            else:
-                state_raw = state_raw[:d_q]
-            state_norm = action_norm.normalize_state(state_raw)
-            state_t = torch.from_numpy(state_norm).unsqueeze(0).to(device)  # (1, d_q)
-
-            instruction = data["instruction"]
-
-            # Model inference
-            a_chunk = model.step(img_t, instruction, state_t)   # (1, H_a, d_a)
-            a_np = a_chunk[0].cpu().float().numpy()             # (H_a, d_a)
-
-            # Denormalize
-            actions_out = []
-            for h in range(a_np.shape[0]):
-                a_raw = action_norm.denormalize_action(a_np[h].copy())
-                actions_out.append(a_raw.tolist())
-
-            await websocket.send(json.dumps({"actions": actions_out}))
+            # Inference
+            print("Received observation")
+            actions = infer_from_json_dict(json_data, model, normalizer, d_q)
+            await websocket.send(json.dumps(actions))
+            print("Sent action chunk")
 
     except websockets.exceptions.ConnectionClosed:
-        print("[Server] Client disconnected")
-    except Exception as e:
-        import traceback
-        print(f"[Server][ERROR] {e}")
-        traceback.print_exc()
+        print("Client disconnected.")
 
 
 # ================================================================
-#  Entry point
+#  Entry point  (edit these paths or pass --ckpt --config --port)
 # ================================================================
-
-def parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(description="DualTreeVLA WebSocket inference server")
-    p.add_argument("--ckpt",   required=True,  help="Path to .pt checkpoint")
-    p.add_argument("--config", default="configs/train_phase2.yaml",
-                   help="Training config YAML")
+if __name__ == "__main__":
+    import argparse
+    p = argparse.ArgumentParser()
+    p.add_argument("--ckpt",   default="checkpoints/runs/phase2/phase2_best.pt")
+    p.add_argument("--config", default="configs/train_phase2.yaml")
     p.add_argument("--stats",  default=None,
-                   help="Path to stats.json for z-score de-normalization. "
-                        "Auto-detected from config if omitted.")
-    p.add_argument("--port",   type=int, default=9000, help="WebSocket port")
-    p.add_argument("--host",   default="0.0.0.0",      help="Bind address")
-    p.add_argument("--img_size", type=int, default=224, help="Model input resolution")
-    p.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
-    return p.parse_args()
+                   help="Path to stats.json.  If omitted, auto-detected from config's data.root.")
+    p.add_argument("--port",   type=int, default=9000)
+    p.add_argument("--host",   default="0.0.0.0")
+    args = p.parse_args()
 
+    port = args.port
 
-def _find_stats(cfg: dict, explicit: Optional[str]) -> Optional[str]:
-    if explicit and os.path.isfile(explicit):
-        return explicit
-    # Auto-detect from data.root in config
-    data_root = cfg.get("data", {}).get("root", "")
-    cands = [
-        os.path.join(str(_PROJ_ROOT), data_root, "meta", "stats.json"),
-        os.path.join(str(_PROJ_ROOT), data_root, "stats.json"),
-        os.path.join(data_root, "meta", "stats.json"),
-    ]
-    for c in cands:
-        if os.path.isfile(c):
-            return c
-    return None
-
-
-def main():
-    args   = parse_args()
-    device = torch.device(args.device)
-
-    print(f"[Server] Loading config: {args.config}")
-    cfg = load_config(args.config)
-    d_q = cfg.get("model", {}).get("d_q", 8)
-
-    print(f"[Server] Loading checkpoint: {args.ckpt}")
-    model = load_model(args.ckpt, cfg, device)
+    print("Loading DualTreeVLA model...")
+    model, normalizer, d_q = load_model_and_normalizer(args.ckpt, args.config, args.stats)
     patch_lang_cache(model)
 
-    stats_path  = _find_stats(cfg, args.stats)
-    action_norm = ActionNorm(stats_path)
-
-    async def serve():
-        handler = lambda ws: handle_client(
-            ws, model, action_norm, device, args.img_size, d_q
-        )
+    async def main():
+        print(f"DualTreeVLA server running at ws://{args.host}:{port}")
         async with websockets.serve(
-            handler, args.host, args.port,
-            max_size=50_000_000,    # 50 MB — enough for 224×224 images
+            lambda ws: handle_request(ws, model, normalizer, d_q),
+            args.host, port, max_size=100_000_000
         ):
-            print(f"[Server] Listening on ws://{args.host}:{args.port}")
-            print("[Server] Waiting for eval_client.py …")
-            await asyncio.Future()  # run forever
+            await asyncio.Future()
 
-    asyncio.run(serve())
-
-
-if __name__ == "__main__":
-    main()
+    asyncio.run(main())

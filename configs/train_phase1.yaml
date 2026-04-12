@@ -34,8 +34,8 @@ data:
   img_w:       224
   d_q:         8
   d_a:         7
-  max_seqlen:  64
   normalize:   true
+  # step_level=True is hard-coded in train.py (Evo-1 style: one sample per frame)
 
 # ── Model ─────────────────────────────────────────────────────────────────
 model:
@@ -58,14 +58,14 @@ model:
 
 # ── Training ──────────────────────────────────────────────────────────────
 train:
-  batch_size:    2
+  batch_size:    8       # step-level: each sample is 1 frame, much lighter than full episodes
   num_workers:   4
-  epochs:        50
+  epochs:        5       # step-level: ~101K steps/epoch × 5 epochs = 500K gradient steps
   lr:            1.0e-4
   weight_decay:  1.0e-4
   warmup_ratio:  0.05
   ckpt_dir:      "checkpoints/runs/phase1"
-  save_every:    5
+  save_every:    1
   # Load semantic modules from pre-training
   init_from: "checkpoints/runs/pretrain/pretrain_best.pt"  # shape不匹配的权重会被自动跳过
 

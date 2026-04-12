@@ -207,7 +207,7 @@ def visualize_epoch(
         return
 
     try:
-        sample = dataset[episode_idx]
+        sample = dataset.load_episode(episode_idx)
     except Exception as e:
         log_msg(f"[viz] dataset[{episode_idx}] failed: {e}", accel)
         return
@@ -310,13 +310,14 @@ def train(cfg: dict, phase: int):
     # ── Dataset ──────────────────────────────────────────────────────
     dc = cfg["data"]
     dataset = LiberoDataset(
-        root       = dc["root"],
-        img_h      = dc.get("img_h", 224),
-        img_w      = dc.get("img_w", 224),
-        d_q        = dc.get("d_q", 8),
-        d_a        = dc.get("d_a", 7),
-        max_seqlen = dc.get("max_seqlen", 64),
-        normalize  = dc.get("normalize", True),
+        root        = dc["root"],
+        img_h       = dc.get("img_h", 224),
+        img_w       = dc.get("img_w", 224),
+        d_q         = dc.get("d_q", 8),
+        d_a         = dc.get("d_a", 7),
+        H_a         = mc.get("H_a", 16),
+        normalize   = dc.get("normalize", True),
+        step_level  = True,   # Evo-1 style: per-step samples, covers every frame
     )
     log_msg(f"{tag} Dataset: {len(dataset)} episodes", accel)
 
