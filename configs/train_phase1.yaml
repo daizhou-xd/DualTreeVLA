@@ -60,7 +60,7 @@ model:
 train:
   batch_size:    8       # step-level: each sample is 1 frame, much lighter than full episodes
   num_workers:   4
-  epochs:        5       # step-level: ~101K steps/epoch × 5 epochs = 500K gradient steps
+  epochs:        20      # ~748 grad updates/epoch (8GPU×batch8÷grad_accum2), 20ep≈15000 steps
   lr:            1.0e-4
   weight_decay:  1.0e-4
   warmup_ratio:  0.05
