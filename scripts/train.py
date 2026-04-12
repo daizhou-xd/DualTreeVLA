@@ -533,8 +533,12 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", required=True)
     parser.add_argument("--phase",  type=int, required=True, choices=[1, 2])
+    parser.add_argument("--resume", default=None,
+                        help="Resume from checkpoint (overrides train.resume_from in yaml)")
     args = parser.parse_args()
     cfg  = load_cfg(args.config)
+    if args.resume:
+        cfg.setdefault("train", {})["resume_from"] = args.resume
     train(cfg, phase=args.phase)
 
 
