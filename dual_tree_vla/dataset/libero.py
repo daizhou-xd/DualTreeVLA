@@ -32,6 +32,7 @@ from __future__ import annotations
 import io
 import json
 import os
+from collections import OrderedDict
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
@@ -228,7 +229,11 @@ class LiberoDataset(Dataset):
         self.max_seqlen = max_seqlen
         self.step_level = step_level
         self._step_records: List[Tuple[int, int]] = []  # (record_idx, frame_t)
-        self._episode_cache: Dict[int, Dict] = {}  # record_idx → cached episode data (lazy, per-worker)
+        # LRU episode cache: keys are evicted when size exceeds _MAX_CACHE_EPISODES.
+        # Each worker process has its own copy; limit prevents OOM with many workers.
+        # 64 episodes × ~3 GB worst-case JPEG bytes per worker is acceptable.
+        self._MAX_CACHE_EPISODES: int = 64
+        self._episode_cache: OrderedDict = OrderedDict()  # record_idx → cached dict
 
         all_roots = [Path(root)] if root is not None else [Path(r) for r in roots]  # type: ignore[arg-type]
 
@@ -440,9 +445,16 @@ class LiberoDataset(Dataset):
         For step_level (frame_t is not None): decodes only ONE JPEG frame instead of
         all T frames in the episode  — the main speedup vs the old implementation.
         """
-        # ── Episode-level cache lookup ────────────────────────────────
-        if record_idx not in self._episode_cache:
+        # ── Episode-level cache lookup (LRU) ──────────────────────────────
+        if record_idx in self._episode_cache:
+            # Move to end (most-recently-used)
+            self._episode_cache.move_to_end(record_idx)
+        else:
             self._episode_cache[record_idx] = self._cache_episode(record_idx)
+            self._episode_cache.move_to_end(record_idx)
+            # Evict least-recently-used when over limit
+            while len(self._episode_cache) > self._MAX_CACHE_EPISODES:
+                self._episode_cache.popitem(last=False)
         cached = self._episode_cache[record_idx]
 
         img_bytes: List[bytes] = cached["img_bytes"]
