@@ -289,7 +289,9 @@ def train(cfg: dict, phase: int):
 
     # ── Accelerator ─────────────────────────────────────────────────
     if _ACCELERATE:
-        ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=False)
+        # Phase 2 unfreezes all params but jump_head/sem_proj/mlp_elev don't
+        # participate in L_flow gradient path → must allow unused parameters.
+        ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=(phase == 2))
         accel = Accelerator(
             mixed_precision=cfg.get("mixed_precision", "bf16"),
             gradient_accumulation_steps=cfg.get("grad_accum", 1),
