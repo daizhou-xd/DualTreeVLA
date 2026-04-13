@@ -456,43 +456,66 @@ def train(cfg: dict, phase: int):
             instructions: List[str] = batch["instructions"]
 
             # ── 前向 + 损失（仅 L_flow）────────────────────────────
-            losses = model(
-                images=frames,
-                instructions=instructions,
-                states=states,
-                actions=actions,
-                mode=mode_str,
-            )
-            loss = losses["total"]
-
-            # 数值稳定性检查
-            if not torch.isfinite(loss):
-                log_msg(f"{tag} step={global_step} loss=NaN/inf, 跳过本批", accel)
-                optimizer.zero_grad()
-                continue
-
+            # IMPORTANT: accel.accumulate() is required for gradient accumulation
+            # to actually work. Without it, optimizer.step() runs every batch
+            # instead of every grad_accum batches.
             if _ACCELERATE and accel is not None:
-                accel.backward(loss)
-                accel.clip_grad_norm_(model.parameters(), 1.0)
-            else:
-                loss.backward()
-                nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                with accel.accumulate(model):
+                    losses = model(
+                        images=frames,
+                        instructions=instructions,
+                        states=states,
+                        actions=actions,
+                        mode=mode_str,
+                    )
+                    loss = losses["total"]
 
-            optimizer.step()
-            scheduler.step()
-            optimizer.zero_grad()
+                    if torch.isfinite(loss):
+                        accel.backward(loss)
+                    else:
+                        log_msg(f"{tag} step={global_step} loss=NaN/inf, skipping backward", accel)
+
+                    # clip + step only when gradients are actually synced
+                    if accel.sync_gradients:
+                        accel.clip_grad_norm_(model.parameters(), 1.0)
+                        optimizer.step()
+                        optimizer.zero_grad()
+
+                # scheduler steps every batch (schedule parameterised per-batch)
+                scheduler.step()
+            else:
+                losses = model(
+                    images=frames,
+                    instructions=instructions,
+                    states=states,
+                    actions=actions,
+                    mode=mode_str,
+                )
+                loss = losses["total"]
+
+                if torch.isfinite(loss):
+                    loss.backward()
+                    nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                    optimizer.step()
+                    scheduler.step()
+                    optimizer.zero_grad()
+                else:
+                    log_msg(f"{tag} step={global_step} loss=NaN/inf, 跳过本批", accel)
+
             global_step += 1
-            epoch_loss_sum += loss.item()
+            if torch.isfinite(loss):
+                epoch_loss_sum += loss.item()
 
             if global_step % 50 == 0 and is_main(accel):
                 lr_now = scheduler.get_last_lr()[0]
+                loss_val = loss.item() if torch.isfinite(loss) else float("nan")
                 log_msg(
                     f"{tag} ep={epoch}/{tc['epochs']}  step={global_step}"
-                    f"  L_flow={loss.item():.4f}  lr={lr_now:.2e}",
+                    f"  L_flow={loss_val:.4f}  lr={lr_now:.2e}",
                     accel,
                 )
                 if _WANDB:
-                    wandb.log({"train/L_flow": loss.item(), "lr": lr_now},
+                    wandb.log({"train/L_flow": loss_val, "lr": lr_now},
                               step=global_step)
 
         avg_loss = epoch_loss_sum / max(len(loader), 1)

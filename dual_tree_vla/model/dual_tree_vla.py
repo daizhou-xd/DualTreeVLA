@@ -453,7 +453,19 @@ class DualTreeVLA(nn.Module):
                     tree_b.elevation_pending_parent = None
 
                 Z_M_b = self.tree_ssm(tree_b, device=device)   # (N_M, d_ssm)
-                m_ctx_list.append(Z_M_b[-1])                   # (d_ssm,)
+                # When tree has no abstract nodes (step_level training: tree reset
+                # each forward, T=1 → only 1 leaf, s=None → TreeSSMReadout returns
+                # zeros), fall back to z_v_mean as a meaningful memory proxy so
+                # CrossModalFusion and tree_ssm parameters receive useful gradients.
+                m_ctx_b = Z_M_b[-1]
+                if tree_b.size() <= 1:
+                    # Project visual mean into d_ssm space via tree_ssm's abs_in_proj:
+                    # use a detached proxy so the fallback doesn't interfere with the
+                    # tree_ssm output gradient path.
+                    m_ctx_b = z_v_mean_t[b].detach()[:self.tree_ssm.d_ssm]
+                    if m_ctx_b.shape[0] < self.tree_ssm.d_ssm:
+                        m_ctx_b = F.pad(m_ctx_b, (0, self.tree_ssm.d_ssm - m_ctx_b.shape[0]))
+                m_ctx_list.append(m_ctx_b)
 
             m_ctx_t = torch.stack(m_ctx_list, dim=0)           # (B, d_ssm)
             Z_fused_t = self.fusion(z_v_mean_t, m_ctx_t, g_lang, q_t)   # (B, 1, d)
