@@ -161,7 +161,9 @@ class DualTreeVLA(nn.Module):
 
         # ── Tree pool ─────────────────────────────────────────────────
         self._tree_pool: Dict[int, HierarchicalMemoryTree] = {}
-        self._tree_cfg = dict(d=d, d_a=d_a, K_elev=K_elev, delta_w=delta_w, mount_tau=mount_tau)
+        self._tree_K_elev = int(K_elev)
+        self._tree_delta_w = float(delta_w)
+        self._tree_mount_tau = float(mount_tau)
 
     # ---------------------------------------------------------------- #
     #  Tree management                                                  #
@@ -169,13 +171,35 @@ class DualTreeVLA(nn.Module):
 
     def get_tree(self, batch_idx: int) -> HierarchicalMemoryTree:
         if batch_idx not in self._tree_pool:
-            self._tree_pool[batch_idx] = HierarchicalMemoryTree(**self._tree_cfg)
+            self._tree_pool[batch_idx] = HierarchicalMemoryTree(
+                d=self.d,
+                d_a=self.d_a,
+                K_elev=self._tree_K_elev,
+                delta_w=self._tree_delta_w,
+                mount_tau=self._tree_mount_tau,
+            )
         return self._tree_pool[batch_idx]
 
     def reset_trees(self, batch_size: int = 1):
         self._tree_pool.clear()
         for i in range(batch_size):
-            self._tree_pool[i] = HierarchicalMemoryTree(**self._tree_cfg)
+            self._tree_pool[i] = HierarchicalMemoryTree(
+                d=self.d,
+                d_a=self.d_a,
+                K_elev=self._tree_K_elev,
+                delta_w=self._tree_delta_w,
+                mount_tau=self._tree_mount_tau,
+            )
+
+    def reset_tree_by_key(self, key: int):
+        """Reset only one persistent tree (used by episode-level training state)."""
+        self._tree_pool[key] = HierarchicalMemoryTree(
+            d=self.d,
+            d_a=self.d_a,
+            K_elev=self._tree_K_elev,
+            delta_w=self._tree_delta_w,
+            mount_tau=self._tree_mount_tau,
+        )
 
     # ---------------------------------------------------------------- #
     #  Helpers                                                          #
@@ -332,7 +356,7 @@ class DualTreeVLA(nn.Module):
         a_hat_1 = a_pred[:, 0]                                     # (1, d_a)
 
         # 7. JumpAwareHead → p_jump
-        active_node = tree.nodes.get(tree.active_id)
+        active_node = tree.nodes.get(tree.active_id) if tree.active_id is not None else None
         A_act = self._get_A_act_tensor(active_node, device)        # (1, L, d_a)
         p_jump, _ = self.jump_head(A_act, a_hat_1)
         force_branch = bool(p_jump.item() >= 0.5)
@@ -361,6 +385,8 @@ class DualTreeVLA(nn.Module):
         instructions: List[str],
         states: torch.Tensor,           # (B, T, d_q)
         actions: torch.Tensor,          # (B, T, d_a)
+        episode_ids: Optional[torch.Tensor] = None,
+        frame_indices: Optional[torch.Tensor] = None,
         subtask_ids: Optional[torch.Tensor] = None,
         subtask_descs: Optional[List[List[str]]] = None,
         mode: str = "phase1",
@@ -379,7 +405,13 @@ class DualTreeVLA(nn.Module):
         compute_flow = (mode in ("phase1", "phase2"))
         compute_jump = (mode == "pretrain")
 
-        self.reset_trees(B)
+        # step-level training (T=1) keeps one persistent tree per episode id.
+        # sequence training / pretrain keeps legacy behavior (reset per batch).
+        use_episode_persistent_tree = (
+            episode_ids is not None and frame_indices is not None and T == 1 and compute_flow
+        )
+        if not use_episode_persistent_tree:
+            self.reset_trees(B)
 
         # Shared language encoding
         _, g_lang = self._encode_language(instructions, device)    # (B, d_lang)
@@ -401,8 +433,17 @@ class DualTreeVLA(nn.Module):
             # s_top and β per sample
             s_top_list = []
             beta_list  = []
+            tree_keys: List[int] = []
             for b in range(B):
-                tree_b = self.get_tree(b)
+                if use_episode_persistent_tree:
+                    assert episode_ids is not None and frame_indices is not None
+                    key_b = int(episode_ids[b].item())
+                    if int(frame_indices[b].item()) == 0:
+                        self.reset_tree_by_key(key_b)
+                else:
+                    key_b = b
+                tree_keys.append(key_b)
+                tree_b = self.get_tree(key_b)
                 s_top_b = self._get_s_top(tree_b, device, g_lang.dtype)
                 s_top_list.append(s_top_b)
                 beta_list.append(self._compute_beta(tree_b))
@@ -415,14 +456,15 @@ class DualTreeVLA(nn.Module):
                 )
             else:
                 Z_v_t = self.sgmts(imgs_t, g_lang, s_top_list, beta_list)   # (B, P, d_visual)
+            assert Z_v_t is not None
 
             z_v_mean_t = Z_v_t.mean(1)   # (B, d_visual)
 
             # Per-sample: JumpAwareHead + tree update
             m_ctx_list = []
             for b in range(B):
-                tree_b      = self.get_tree(b)
-                active_node = tree_b.nodes.get(tree_b.active_id)
+                tree_b      = self.get_tree(tree_keys[b])
+                active_node = tree_b.nodes.get(tree_b.active_id) if tree_b.active_id is not None else None
                 A_act_b     = self._get_A_act_tensor(active_node, device)  # (1, L, d_a)
 
                 # During training always use GT action for jump + insert (teacher forcing)

@@ -483,6 +483,8 @@ class LiberoDataset(Dataset):
                 "actions":     a_chunk,                                   # (H_a, d_a)
                 "states":      torch.from_numpy(s_raw[frame_t].copy()).unsqueeze(0),  # (1, d_q)
                 "instruction": instruction,
+                "episode_id":  int(record_idx),
+                "frame_idx":   int(frame_t),
             }
 
         # ── Episode-level return (viz / backward-compat) ────────────
@@ -637,6 +639,8 @@ def libero_collate(batch: List[Dict]) -> Dict:
     frames  = torch.zeros(B, T_frames,  C, H, W)
     actions = torch.zeros(B, T_actions, d_a)
     states  = torch.zeros(B, T_frames,  d_q)
+    episode_ids = torch.full((B,), -1, dtype=torch.long)
+    frame_indices = torch.full((B,), -1, dtype=torch.long)
     instructions: List[str] = []
 
     for i, s in enumerate(batch):
@@ -647,7 +651,17 @@ def libero_collate(batch: List[Dict]) -> Dict:
         states[i, :Tf]  = s["states"]
         if Tf < T_frames:
             frames[i, Tf:] = s["frames"][-1:].expand(T_frames - Tf, -1, -1, -1)
+        if "episode_id" in s:
+            episode_ids[i] = int(s["episode_id"])
+        if "frame_idx" in s:
+            frame_indices[i] = int(s["frame_idx"])
         instructions.append(s["instruction"])
 
-    return {"frames": frames, "actions": actions, "states": states,
-            "instructions": instructions}
+    return {
+        "frames": frames,
+        "actions": actions,
+        "states": states,
+        "instructions": instructions,
+        "episode_ids": episode_ids,
+        "frame_indices": frame_indices,
+    }
